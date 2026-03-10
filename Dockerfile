@@ -16,7 +16,7 @@ COPY frontend/ ./
 RUN mkdir -p /app/backend/static && npm run build
 
 # ── 2. Build Go binary ──────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.25-alpine AS go-builder
 WORKDIR /app/backend
 
 # Dependency cache layer
