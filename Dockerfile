@@ -107,6 +107,7 @@ VOLUME ["/data"]
 EXPOSE 8888
 EXPOSE 8080
 EXPOSE 1080
+EXPOSE 8388
 
 # ── Capabilities needed for TUN/VPN ──────────────────────────────────────────
 # Requires: --cap-add NET_ADMIN  and  --device /dev/net/tun

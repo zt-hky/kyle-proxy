@@ -8,8 +8,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"kyle-proxy/internal/auth"
 	"kyle-proxy/internal/config"
 	"kyle-proxy/internal/proxy"
+	"kyle-proxy/internal/users"
 	"kyle-proxy/internal/vpn"
 )
 
@@ -19,22 +21,31 @@ func NewRouter(
 	v *vpn.Manager,
 	p *proxy.Manager,
 	c *config.Manager,
+	us *users.Store,
+	ga *auth.GitHubAuth,
 	staticFS fs.FS,
 ) http.Handler {
-	h := newHandler(v, p, c)
+	h := newHandler(v, p, c, us, ga)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
+	r.Use(ga.Middleware) // no-op when GitHub auth is not configured
 
-	// ── API routes ───────────────────────────────────────────────────────────
+	// ── Auth routes (public) ─────────────────────────────────────────────────
+	r.Get("/auth/login", h.handleAuthLogin)
+	r.Get("/auth/callback", h.handleAuthCallback)
+	r.Get("/auth/logout", h.handleAuthLogout)
+	r.Get("/api/auth/status", h.handleAuthStatus)
+
+	// ── Core API routes ──────────────────────────────────────────────────────
 	r.Get("/api/health", h.handleHealth)
 	r.Get("/api/status", h.handleStatus)
 
 	r.Get("/api/config", h.handleGetConfig)
 	r.Put("/api/config", h.handleUpdateConfig)
-	r.Post("/api/config", h.handleUpdateConfig) // also accept POST for convenience
+	r.Post("/api/config", h.handleUpdateConfig)
 
 	r.Post("/api/vpn/connect", h.handleConnect)
 	r.Post("/api/vpn/disconnect", h.handleDisconnect)
@@ -44,19 +55,31 @@ func NewRouter(
 
 	r.Post("/api/certs/upload", h.handleCertUpload)
 
-	// ── PAC file ─────────────────────────────────────────────────────────────
+	// ── User management API ──────────────────────────────────────────────────
+	r.Get("/api/users", h.handleListUsers)
+	r.Post("/api/users", h.handleCreateUser)
+	r.Put("/api/users/{id}", h.handleUpdateUser)
+	r.Delete("/api/users/{id}", h.handleDeleteUser)
+	r.Get("/api/users/{id}/vmess", h.handleVMessExport)
+
+	// ── Group management API ──────────────────────────────────────────────────
+	r.Get("/api/groups", h.handleListGroups)
+	r.Post("/api/groups", h.handleCreateGroup)
+	r.Put("/api/groups/{id}", h.handleUpdateGroup)
+	r.Delete("/api/groups/{id}", h.handleDeleteGroup)
+
+	// ── PAC files (public — no auth required) ────────────────────────────────
 	r.Get("/pac", h.handlePAC)
+	r.Get("/pac/{username}", h.handleUserPAC)
 
 	// ── Static SPA ───────────────────────────────────────────────────────────
 	if staticFS != nil {
 		staticServer := http.FileServer(http.FS(staticFS))
 		r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
-			// For SPA routing: serve index.html for unknown paths
 			path := strings.TrimPrefix(r.URL.Path, "/")
 			if path == "" {
 				path = "index.html"
 			}
-			// Try to serve the file; fall back to index.html for SPA routing
 			f, err := staticFS.Open(path)
 			if err != nil {
 				r.URL.Path = "/index.html"
@@ -66,7 +89,6 @@ func NewRouter(
 			staticServer.ServeHTTP(w, r)
 		})
 	} else {
-		// Dev mode: show a simple redirect hint
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "http://localhost:5173", http.StatusTemporaryRedirect)
 		})
@@ -75,7 +97,7 @@ func NewRouter(
 	return r
 }
 
-// corsMiddleware allows all origins in development; tighten in production if needed
+// corsMiddleware allows all origins in development; tighten in production if needed.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -88,3 +110,4 @@ func corsMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+

@@ -1,28 +1,32 @@
 package api
 
 import (
-"encoding/json"
-"fmt"
-"net"
-"net/http"
-"os"
-"os/exec"
-"time"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"time"
 
-"kyle-proxy/internal/config"
-"kyle-proxy/internal/proxy"
-"kyle-proxy/internal/vpn"
+	"kyle-proxy/internal/auth"
+	"kyle-proxy/internal/config"
+	"kyle-proxy/internal/proxy"
+	"kyle-proxy/internal/users"
+	"kyle-proxy/internal/vpn"
 )
 
 // Handler holds all dependencies for HTTP handlers
 type Handler struct {
-	vpnMgr   *vpn.Manager
-	proxyMgr *proxy.Manager
-	cfgMgr   *config.Manager
+	vpnMgr     *vpn.Manager
+	proxyMgr   *proxy.Manager
+	cfgMgr     *config.Manager
+	userStore  *users.Store
+	githubAuth *auth.GitHubAuth
 }
 
-func newHandler(v *vpn.Manager, p *proxy.Manager, c *config.Manager) *Handler {
-	return &Handler{vpnMgr: v, proxyMgr: p, cfgMgr: c}
+func newHandler(v *vpn.Manager, p *proxy.Manager, c *config.Manager, us *users.Store, ga *auth.GitHubAuth) *Handler {
+	return &Handler{vpnMgr: v, proxyMgr: p, cfgMgr: c, userStore: us, githubAuth: ga}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -44,12 +48,15 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 type statusResponse struct {
-	VPN   vpn.Status   `json:"vpn"`
-	Proxy proxy.Status `json:"proxy"`
+	VPN   vpn.Status       `json:"vpn"`
+	Proxy proxyStatusExt   `json:"proxy"`
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusResponse{VPN: h.vpnMgr.GetStatus(), Proxy: h.proxyMgr.GetStatus()})
+	writeJSON(w, http.StatusOK, statusResponse{
+		VPN:   h.vpnMgr.GetStatus(),
+		Proxy: toStatusExt(h.proxyMgr.GetStatus(), h.proxyMgr.GetVMessPort()),
+	})
 }
 
 type configResponse struct {
@@ -156,14 +163,6 @@ func (h *Handler) handleLogs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]string{"lines": h.vpnMgr.GetLogs()})
 }
 
-type proxyInfoResponse struct {
-	HostIP     string `json:"host_ip"`
-	HTTPPort   int    `json:"http_port"`
-	Socks5Port int    `json:"socks5_port"`
-	HTTPProxy  string `json:"http_proxy"`
-	Socks5     string `json:"socks5"`
-	PACUrl     string `json:"pac_url"`
-}
 
 func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfgMgr.Get()
@@ -171,12 +170,16 @@ func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
 	if rh, _, err := net.SplitHostPort(r.Host); err == nil && rh != "" {
 		host = rh
 	}
-	writeJSON(w, http.StatusOK, proxyInfoResponse{
-HostIP: host, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
-HTTPProxy: fmt.Sprintf("http://%s:%d", host, cfg.Proxy.HTTPPort),
-Socks5:    fmt.Sprintf("socks5://%s:%d", host, cfg.Proxy.Socks5Port),
-PACUrl:    fmt.Sprintf("http://%s:8888/pac", host),
-})
+	vMessPort := h.proxyMgr.GetVMessPort()
+	hasUsers := len(h.userStore.ListUsers()) > 0
+	writeJSON(w, http.StatusOK, proxyInfoExtended{
+		HostIP: host, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
+		VMessPort:  vMessPort,
+		HTTPProxy:  fmt.Sprintf("http://%s:%d", host, cfg.Proxy.HTTPPort),
+		Socks5:     fmt.Sprintf("socks5://%s:%d", host, cfg.Proxy.Socks5Port),
+		PACUrl:     fmt.Sprintf("http://%s:8888/pac", host),
+		AuthMode:   hasUsers,
+	})
 }
 
 // GET /pac — Proxy Auto-Config for iPhone:

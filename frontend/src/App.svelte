@@ -5,6 +5,7 @@
   import ConfigPanel from './lib/ConfigPanel.svelte'
   import ProxyPanel from './lib/ProxyPanel.svelte'
   import LogPanel from './lib/LogPanel.svelte'
+  import UsersPanel from './lib/UsersPanel.svelte'
 
   let tab = 'dashboard'
   let status = { vpn: { state: 'disconnected' }, proxy: { running: false } }
@@ -12,22 +13,32 @@
   let pollInterval = null
   let toast = null
 
+  // Auth state
+  let authState = { auth_enabled: false, logged_in: true, login: 'anonymous' }
+
   function showToast(msg, type = 'info') {
     toast = { msg, type }
     setTimeout(() => (toast = null), 3500)
   }
 
   async function poll() {
-    try {
-      status = await api.status()
-    } catch (e) {
-      // silently ignore poll failures
-    }
+    try { status = await api.status() } catch {}
+  }
+
+  async function logout() {
+    await api.authLogout()
+    window.location.reload()
   }
 
   onMount(async () => {
     await poll()
     try { proxyInfo = await api.proxyInfo() } catch {}
+    try { authState = await api.authStatus() } catch {}
+    // Redirect to login if auth required and not logged in
+    if (authState.auth_enabled && !authState.logged_in) {
+      window.location.href = api.authLoginUrl()
+      return
+    }
     pollInterval = setInterval(poll, 3000)
   })
 
@@ -43,15 +54,23 @@
       </svg>
       <span>Kyle VPN Proxy</span>
     </div>
-    <div class="status-badges">
-      <span class="badge" class:green={status.vpn.state === 'connected'}
-                          class:yellow={status.vpn.state === 'connecting' || status.vpn.state === 'disconnecting'}
-                          class:red={status.vpn.state === 'error'}>
-        VPN: {status.vpn.state}
-      </span>
-      <span class="badge" class:green={status.proxy.running}>
-        Proxy: {status.proxy.running ? 'running' : 'stopped'}
-      </span>
+    <div class="header-right">
+      <div class="status-badges">
+        <span class="badge" class:green={status.vpn.state === 'connected'}
+                            class:yellow={status.vpn.state === 'connecting' || status.vpn.state === 'disconnecting'}
+                            class:red={status.vpn.state === 'error'}>
+          VPN: {status.vpn.state}
+        </span>
+        <span class="badge" class:green={status.proxy.running}>
+          Proxy: {status.proxy.running ? 'running' : 'stopped'}
+        </span>
+      </div>
+      {#if authState.auth_enabled && authState.logged_in}
+        <div class="user-info">
+          <span>🐙 {authState.login}</span>
+          <button class="btn-logout" on:click={logout}>Logout</button>
+        </div>
+      {/if}
     </div>
   </header>
 
@@ -65,6 +84,7 @@
     <button class:active={tab === 'dashboard'} on:click={() => (tab = 'dashboard')}>🏠 Dashboard</button>
     <button class:active={tab === 'config'} on:click={() => (tab = 'config')}>⚙️ Config</button>
     <button class:active={tab === 'proxy'} on:click={() => (tab = 'proxy')}>📡 Proxy</button>
+    <button class:active={tab === 'users'} on:click={() => (tab = 'users')}>🔐 Users</button>
     <button class:active={tab === 'logs'} on:click={() => (tab = 'logs')}>📋 Logs</button>
   </nav>
 
@@ -76,6 +96,8 @@
       <ConfigPanel on:toast={(e) => showToast(e.detail.msg, e.detail.type)} />
     {:else if tab === 'proxy'}
       <ProxyPanel {proxyInfo} {status} />
+    {:else if tab === 'users'}
+      <UsersPanel {proxyInfo} on:toast={(e) => showToast(e.detail.msg, e.detail.type)} />
     {:else if tab === 'logs'}
       <LogPanel />
     {/if}
@@ -143,7 +165,10 @@
     margin-bottom: 16px;
   }
   .logo { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 700; color: #6366f1; }
+  .header-right { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; justify-content: flex-end; }
   .status-badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .user-info { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #94a3b8; }
+  .btn-logout { background: #334155; color: #94a3b8; font-size: 12px; padding: 4px 10px; }
   .badge {
     font-size: 11px;
     padding: 3px 10px;

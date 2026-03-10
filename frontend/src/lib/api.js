@@ -16,13 +16,14 @@ async function request(method, path, body) {
 }
 
 export const api = {
-  status: () => request('GET', '/api/status'),
-  getConfig: () => request('GET', '/api/config'),
+  // ── Core ──────────────────────────────────────────────────────────────────
+  status:     () => request('GET', '/api/status'),
+  getConfig:  () => request('GET', '/api/config'),
   saveConfig: (data) => request('POST', '/api/config', data),
-  connect: (otp) => request('POST', '/api/vpn/connect', { otp }),
+  connect:    (otp) => request('POST', '/api/vpn/connect', { otp }),
   disconnect: () => request('POST', '/api/vpn/disconnect'),
-  logs: () => request('GET', '/api/logs'),
-  proxyInfo: () => request('GET', '/api/proxy/info'),
+  logs:       () => request('GET', '/api/logs'),
+  proxyInfo:  () => request('GET', '/api/proxy/info'),
   uploadCert: async (file) => {
     const form = new FormData()
     form.append('cert', file)
@@ -33,4 +34,26 @@ export const api = {
     }
     return res.json()
   },
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  authStatus:  () => request('GET', '/api/auth/status'),
+  authLogout:  () => request('GET', '/auth/logout'),
+  authLoginUrl: () => '/auth/login',
+
+  // ── Users ─────────────────────────────────────────────────────────────────
+  listUsers:      () => request('GET', '/api/users'),
+  createUser:     (data) => request('POST', '/api/users', data),
+  updateUser:     (id, data) => request('PUT', `/api/users/${id}`, data),
+  deleteUser:     (id) => request('DELETE', `/api/users/${id}`),
+  getVMessExport: (id, host) => {
+    const q = host ? `?host=${encodeURIComponent(host)}` : ''
+    return request('GET', `/api/users/${id}/vmess${q}`)
+  },
+
+  // ── Groups ────────────────────────────────────────────────────────────────
+  listGroups:   () => request('GET', '/api/groups'),
+  createGroup:  (data) => request('POST', '/api/groups', data),
+  updateGroup:  (id, data) => request('PUT', `/api/groups/${id}`, data),
+  deleteGroup:  (id) => request('DELETE', `/api/groups/${id}`),
 }
+

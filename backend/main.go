@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"kyle-proxy/internal/api"
+	"kyle-proxy/internal/auth"
 	"kyle-proxy/internal/config"
 	"kyle-proxy/internal/proxy"
+	"kyle-proxy/internal/users"
 	"kyle-proxy/internal/vpn"
 )
 
@@ -36,7 +38,33 @@ func main() {
 	proxyMgr := proxy.NewManager(proxy.Config{
 		HTTPPort:   cfg.Proxy.HTTPPort,
 		Socks5Port: cfg.Proxy.Socks5Port,
+		VMessPort:  cfg.Proxy.VMessPort,
 	})
+
+	// ── User store ───────────────────────────────────────────────────────────
+	usersPath := envOr("USERS_PATH", "/data/users.json")
+	userStore, err := users.NewStore(usersPath)
+	if err != nil {
+		log.Printf("⚠️  Could not load user store: %v (starting empty)", err)
+		userStore, _ = users.NewStore("") // in-memory fallback
+	}
+
+	// ── GitHub OAuth ─────────────────────────────────────────────────────────
+	ghAuth := auth.NewGitHubAuth()
+	if ghAuth.Enabled {
+		log.Println("🔐 GitHub OAuth2 authentication enabled")
+	} else {
+		log.Println("⚠️  GitHub auth not configured — management UI is unprotected")
+	}
+
+	// ── Start proxy with current users ───────────────────────────────────────
+	if accts := userStore.AccountsForV2Ray(); len(accts) > 0 {
+		mapped := make([]proxy.UserAccount, len(accts))
+		for i, a := range accts {
+			mapped[i] = proxy.UserAccount{Username: a.Username, Token: a.Token, VMessUUID: a.VMessUUID, Patterns: a.Patterns}
+		}
+		proxyMgr.SetAccountsSilent(mapped) // set before Start so first config write includes users
+	}
 
 	if err := proxyMgr.Start(); err != nil {
 		log.Printf("⚠️  v2ray failed to start: %v (proxy will be unavailable)", err)
@@ -46,7 +74,6 @@ func main() {
 	var staticFS fs.FS
 	sub, err := fs.Sub(embeddedStatic, "static")
 	if err == nil {
-		// Check there's actually content in the embedded dir
 		if f, err2 := sub.Open("index.html"); err2 == nil {
 			f.Close()
 			staticFS = sub
@@ -58,7 +85,7 @@ func main() {
 
 	// ── HTTP server ──────────────────────────────────────────────────────────
 	addr := envOr("LISTEN_ADDR", ":8888")
-	router := api.NewRouter(vpnMgr, proxyMgr, cfgMgr, staticFS)
+	router := api.NewRouter(vpnMgr, proxyMgr, cfgMgr, userStore, ghAuth, staticFS)
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: router,
@@ -94,3 +121,4 @@ func envOr(key, fallback string) string {
 	}
 	return fallback
 }
+

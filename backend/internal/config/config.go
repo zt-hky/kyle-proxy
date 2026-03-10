@@ -31,6 +31,7 @@ type VPNConfig struct {
 type ProxyConfig struct {
 	HTTPPort   int `json:"http_port"`
 	Socks5Port int `json:"socks5_port"`
+	VMessPort  int `json:"vmess_port"` // VMess inbound port for v2box/v2ray clients
 }
 
 // Default returns a config with sensible defaults
@@ -39,6 +40,7 @@ func Default() *AppConfig {
 		Proxy: ProxyConfig{
 			HTTPPort:   8080,
 			Socks5Port: 1080,
+			VMessPort:  8388,
 		},
 	}
 }
