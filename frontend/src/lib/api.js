@@ -49,6 +49,11 @@ export const api = {
     const q = host ? `?host=${encodeURIComponent(host)}` : ''
     return request('GET', `/api/users/${id}/vmess${q}`)
   },
+  // Returns a full v2ray client config JSON with built-in split-tunnel routing rules
+  getV2RayClientConfig: (id, host) => {
+    const q = host ? `?host=${encodeURIComponent(host)}` : ''
+    return request('GET', `/api/users/${id}/v2ray-config${q}`)
+  },
 
   // ── Groups ────────────────────────────────────────────────────────────────
   listGroups:   () => request('GET', '/api/groups'),

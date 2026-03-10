@@ -153,6 +153,9 @@ func (h *Handler) handleVMessExport(w http.ResponseWriter, r *http.Request) {
 
 	host := r.URL.Query().Get("host")
 	if host == "" {
+		host = h.cfgMgr.Get().Proxy.ServerHost
+	}
+	if host == "" {
 		host = getOutboundIP()
 	}
 	port := h.proxyMgr.GetVMessPort()
@@ -166,6 +169,109 @@ func (h *Handler) handleVMessExport(w http.ResponseWriter, r *http.Request) {
 		"username":   u.Username,
 		"note":       fmt.Sprintf("Import in v2box/v2ray: Settings → Add Server → Scan QR or paste vmess:// link"),
 	})
+}
+
+// handleV2RayClientConfig returns a full v2ray client JSON config for import in v2box/v2rayNG.
+// Unlike vmess://, this config includes client-side routing rules for split tunneling:
+// only allowed domains are sent to the proxy; everything else goes direct.
+// GET /api/users/{id}/v2ray-config?host=<override-host>
+func (h *Handler) handleV2RayClientConfig(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	u, err := h.userStore.GetUser(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	cfg := h.cfgMgr.Get()
+	host := r.URL.Query().Get("host")
+	if host == "" {
+		host = cfg.Proxy.ServerHost
+	}
+	if host == "" {
+		host = getOutboundIP()
+	}
+	port := h.proxyMgr.GetVMessPort()
+	patterns := h.userStore.GetUserPatterns(u.Username)
+	writeJSON(w, http.StatusOK, buildV2RayClientConfig(u.VMessUUID, u.Username, host, port, patterns))
+}
+
+// buildV2RayClientConfig generates a v2ray client config for v2box/v2rayNG import.
+//
+// The config sets up local SOCKS5 (1080) and HTTP (8080) inbounds on the device,
+// with a VMess outbound to the server. Routing rules implement split tunneling:
+//   - patterns non-empty → only matching domains go through proxy; rest is DIRECT
+//   - patterns empty     → all traffic goes through proxy
+//
+// This achieves the "only specific URLs through proxy" behaviour on the client side.
+func buildV2RayClientConfig(uuid, username, serverHost string, serverPort int, patterns []string) map[string]any {
+	outbounds := []any{
+		map[string]any{
+			"tag": "proxy", "protocol": "vmess",
+			"settings": map[string]any{
+				"vnext": []any{map[string]any{
+					"address": serverHost,
+					"port":    serverPort,
+					"users": []any{map[string]any{
+						"id": uuid, "alterId": 0, "security": "auto",
+						"email": username + "@kyle-proxy",
+					}},
+				}},
+			},
+			"streamSettings": map[string]any{"network": "tcp"},
+		},
+		map[string]any{"tag": "direct", "protocol": "freedom", "settings": map[string]any{}},
+		map[string]any{
+			"tag": "block", "protocol": "blackhole",
+			"settings": map[string]any{"response": map[string]any{"type": "http"}},
+		},
+	}
+
+	// Build routing rules for client-side split tunneling
+	var rules []any
+	// Private/LAN IPs always bypass proxy
+	rules = append(rules, map[string]any{
+		"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct",
+	})
+	if len(patterns) > 0 {
+		// Split tunnel: only allowed domains go through proxy
+		domains := make([]string, len(patterns))
+		for i, p := range patterns {
+			domains[i] = "regexp:" + p
+		}
+		rules = append(rules, map[string]any{
+			"type": "field", "domain": domains, "outboundTag": "proxy",
+		})
+		// Everything else: go direct (NOT through proxy)
+		rules = append(rules, map[string]any{
+			"type": "field", "network": "tcp,udp", "outboundTag": "direct",
+		})
+	} else {
+		// No restrictions: all traffic through proxy
+		rules = append(rules, map[string]any{
+			"type": "field", "network": "tcp,udp", "outboundTag": "proxy",
+		})
+	}
+
+	return map[string]any{
+		"log": map[string]any{"loglevel": "warning"},
+		"inbounds": []any{
+			map[string]any{
+				"tag": "socks-in", "port": 1080, "listen": "127.0.0.1", "protocol": "socks",
+				"settings": map[string]any{"auth": "noauth", "udp": true},
+				"sniffing": map[string]any{"enabled": true, "destOverride": []string{"http", "tls"}},
+			},
+			map[string]any{
+				"tag": "http-in", "port": 8080, "listen": "127.0.0.1", "protocol": "http",
+				"settings": map[string]any{},
+				"sniffing": map[string]any{"enabled": true, "destOverride": []string{"http", "tls"}},
+			},
+		},
+		"outbounds": outbounds,
+		"routing": map[string]any{
+			"domainStrategy": "IPIfNonMatch",
+			"rules":          rules,
+		},
+	}
 }
 
 // buildVMessLink creates the standard vmess:// URI for v2ray/v2box clients.

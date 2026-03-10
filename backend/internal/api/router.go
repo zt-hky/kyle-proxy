@@ -61,6 +61,7 @@ func NewRouter(
 	r.Put("/api/users/{id}", h.handleUpdateUser)
 	r.Delete("/api/users/{id}", h.handleDeleteUser)
 	r.Get("/api/users/{id}/vmess", h.handleVMessExport)
+	r.Get("/api/users/{id}/v2ray-config", h.handleV2RayClientConfig) // full client config with routing
 
 	// ── Group management API ──────────────────────────────────────────────────
 	r.Get("/api/groups", h.handleListGroups)

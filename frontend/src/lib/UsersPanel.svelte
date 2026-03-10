@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { api } from './api.js'
   import { createEventDispatcher } from 'svelte'
+  import QRCode from 'qrcode'
 
   const dispatch = createEventDispatcher()
   function toast(msg, type = 'info') { dispatch('toast', { msg, type }) }
@@ -25,8 +26,9 @@
   let showGroupForm = false
 
   // VMess modal
-  let vmessModal = null // { link, host, port, uuid, username }
+  let vmessModal = null // { id, link, host, port, uuid, username }
   let vmessCopied = false
+  let qrDataUrl = ''
 
   // ── Data loading ────────────────────────────────────────────────────────────
   async function loadAll() {
@@ -105,8 +107,13 @@
   async function showVMess(u) {
     try {
       const data = await api.getVMessExport(u.id)
-      vmessModal = data
+      vmessModal = { ...data, id: u.id }
       vmessCopied = false
+      qrDataUrl = ''
+      QRCode.toDataURL(data.vmess_link, {
+        width: 220, margin: 2,
+        color: { dark: '#000000', light: '#ffffff' },
+      }).then(url => { qrDataUrl = url }).catch(() => {})
     } catch (e) {
       toast(e.message, 'error')
     }
@@ -117,6 +124,24 @@
     await navigator.clipboard.writeText(vmessModal.vmess_link)
     vmessCopied = true
     setTimeout(() => (vmessCopied = false), 2000)
+  }
+
+  async function downloadClientConfig() {
+    if (!vmessModal) return
+    try {
+      const cfg = await api.getV2RayClientConfig(vmessModal.id)
+      const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `v2ray-${vmessModal.username}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      toast(e.message, 'error')
+    }
   }
 
   // ── Group CRUD ───────────────────────────────────────────────────────────────
@@ -499,4 +524,7 @@
   .vmess-link { font-size: 11px; word-break: break-all; color: #a5b4fc; }
   .vmess-meta { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #94a3b8; }
   .vmess-meta code { color: #e2e8f0; }
+  .qr-wrap { display: flex; flex-direction: column; align-items: center; margin: 10px 0; }
+  .qr-img { width: 200px; height: 200px; image-rendering: pixelated; border-radius: 8px; background: #fff; }
+  .qr-hint { font-size: 11px; color: #94a3b8; margin-top: 6px; }
 </style>

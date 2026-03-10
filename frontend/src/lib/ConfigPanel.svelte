@@ -8,6 +8,7 @@
     portal: '', gateway: '', username: '', password: '',
     cert_file: '', trust_cert: false, extra_args: [],
     http_port: 8080, socks5_port: 1080,
+    vmess_port: 8388, server_host: '',
   }
   let extraArgsStr = ''
   let hasPass = false
@@ -28,6 +29,8 @@
         extra_args: data.extra_args ?? [],
         http_port: data.http_port ?? 8080,
         socks5_port: data.socks5_port ?? 1080,
+        vmess_port: data.vmess_port ?? 8388,
+        server_host: data.server_host ?? '',
       }
       hasPass = data.has_password ?? false
       extraArgsStr = (data.extra_args ?? []).join(' ')
@@ -127,7 +130,16 @@
       <label for="socksPort">SOCKS5 Proxy Port</label>
       <input id="socksPort" type="number" min="1024" max="65535" bind:value={cfg.socks5_port} />
     </div>
+    <div class="form-row">
+      <label for="vmessPort">VMess Port</label>
+      <input id="vmessPort" type="number" min="1024" max="65535" bind:value={cfg.vmess_port} />
+    </div>
+    <div class="form-row">
+      <label for="serverHost">Public Host (for vmess:// sharing)</label>
+      <input id="serverHost" type="text" placeholder="e.g. 192.168.1.100 or vpn.home.lan" bind:value={cfg.server_host} />
+    </div>
   </div>
+  <p class="hint">Leave <em>Public Host</em> empty to auto-detect the server IP. Set it if clients connect via a fixed hostname or public IP.</p>
 </div>
 
 <!-- Custom TLS Certificate -->

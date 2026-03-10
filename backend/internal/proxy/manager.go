@@ -328,127 +328,86 @@ type v2rayDNS struct {
 
 // buildV2RayConfig generates the v2ray config.
 //
-// When accounts is non-empty:
-//   - HTTP and SOCKS5 inbounds require username + token auth
-//   - VMess inbound is populated with all user UUIDs
-//   - Routing rules enforce per-user domain patterns:
-//     users WITH groups → allow group patterns → block everything else
-//     users WITHOUT groups → allow all
-//
-// When accounts is empty → backward-compat open proxy (no auth).
+// No accounts → open proxy: HTTP + SOCKS5 + VMess (no auth, backward compat).
+// With accounts → VMess-ONLY: HTTP and SOCKS5 inbounds are disabled so that
+// all clients must authenticate with a per-user UUID. Per-user domain routing
+// is enforced server-side; the client-side split-tunnel config is provided
+// via /api/users/{id}/v2ray-config.
 func buildV2RayConfig(cfg Config, accounts []UserAccount) v2rayConfig {
 	sniff := &v2raySniff{Enabled: true, DestOverride: []string{"http", "tls"}}
+	dns := v2rayDNS{Servers: []string{"8.8.8.8", "1.1.1.1"}}
 
-	var httpSettings interface{}
-	var socksSettings interface{}
+	// ── No-auth mode ─────────────────────────────────────────────────────────
+	if len(accounts) == 0 {
+		return v2rayConfig{
+			Log: v2rayLog{LogLevel: "warning"},
+			Inbounds: []v2rayInbound{
+				{Port: cfg.HTTPPort, Listen: "0.0.0.0", Protocol: "http", Tag: "http-in",
+					Settings: v2rayHTTPSettings{AllowTransparent: false, Timeout: 300}, Sniffing: sniff},
+				{Port: cfg.Socks5Port, Listen: "0.0.0.0", Protocol: "socks", Tag: "socks-in",
+					Settings: v2raySocksSettings{Auth: "noauth", UDP: true, IP: "0.0.0.0"}, Sniffing: sniff},
+				{Port: cfg.VMessPort, Listen: "0.0.0.0", Protocol: "vmess", Tag: "vmess-in",
+					Settings: v2rayVMessSettings{Clients: []v2rayVMessClient{
+						{ID: "00000000-0000-0000-0000-000000000000", Email: "default@kyle-proxy", AlterId: 0},
+					}}},
+			},
+			Outbounds: []v2rayOutbound{{Protocol: "freedom", Tag: "direct", Settings: v2rayFreedomSettings{}}},
+			DNS:       dns,
+		}
+	}
 
+	// ── Auth mode: VMess-only ─────────────────────────────────────────────────
+	// HTTP and SOCKS5 are intentionally absent; clients must use VMess + UUID.
+	vmessClients := make([]v2rayVMessClient, len(accounts))
+	for i, a := range accounts {
+		vmessClients[i] = v2rayVMessClient{ID: a.VMessUUID, Email: a.Username + "@kyle-proxy", AlterId: 0}
+	}
+
+	var bh v2rayBlackholeSettings
+	bh.Response.Type = "http"
 	outbounds := []v2rayOutbound{
 		{Protocol: "freedom", Tag: "direct", Settings: v2rayFreedomSettings{}},
+		{Protocol: "blackhole", Tag: "block", Settings: bh},
 	}
 
-	var routing *v2rayRouting
-
-	if len(accounts) == 0 {
-		// no auth mode
-		httpSettings = v2rayHTTPSettings{AllowTransparent: false, Timeout: 300}
-		socksSettings = v2raySocksSettings{Auth: "noauth", UDP: true, IP: "0.0.0.0"}
-	} else {
-		// auth mode: HTTP basic + SOCKS5 password
-		accs := make([]v2rayAccount, 0, len(accounts))
-		for _, a := range accounts {
-			accs = append(accs, v2rayAccount{User: a.Username, Pass: a.Token})
-		}
-		httpSettings = v2rayHTTPSettingsAuth{AllowTransparent: false, Timeout: 300, Accounts: accs}
-		socksSettings = v2raySocksSettingsAuth{Auth: "password", UDP: false, IP: "0.0.0.0", Accounts: accs}
-
-		// Blackhole outbound for blocked traffic
-		var bh v2rayBlackholeSettings
-		bh.Response.Type = "http"
-		outbounds = append(outbounds, v2rayOutbound{Protocol: "blackhole", Tag: "block", Settings: bh})
-
-		// Build VMess routing rules per user.
-		// NOTE: The "user" field in v2ray routing matches VMess client email only,
-		// not HTTP/SOCKS5 usernames. HTTP/SOCKS5 per-user filtering is handled by
-		// PAC files served at /pac/{username}.
-		// Every rule MUST have at least one effective match condition; a bare
-		// outboundTag-only rule is rejected by v2ray 5.x with
-		// "this rule has no effective fields".
-		var rules []v2rayRule
-		for _, a := range accounts {
-			// VMess email is "<username>@kyle-proxy" — set in the VMess client config
-			email := a.Username + "@kyle-proxy"
-			if len(a.Patterns) > 0 {
-				// domain-prefixed patterns for v2ray regexp matching
-				domains := make([]string, len(a.Patterns))
-				for i, p := range a.Patterns {
-					domains[i] = "regexp:" + p
-				}
-				// allow matched domains for this VMess user
-				rules = append(rules, v2rayRule{
-					Type:        "field",
-					User:        []string{email},
-					Domain:      domains,
-					OutboundTag: "direct",
-				})
-				// block everything else for this VMess user
-				// network:"tcp,udp" is the catch-all condition (required by v2ray 5.x)
-				rules = append(rules, v2rayRule{
-					Type:        "field",
-					User:        []string{email},
-					Network:     "tcp,udp",
-					OutboundTag: "block",
-				})
-			} else {
-				// no restriction: allow all traffic for this VMess user
-				rules = append(rules, v2rayRule{
-					Type:        "field",
-					User:        []string{email},
-					Network:     "tcp,udp",
-					OutboundTag: "direct",
-				})
-			}
-		}
-		// Default catch-all: block any remaining (unauthenticated) VMess traffic.
-		// Scoped to vmess-in so HTTP/SOCKS5 traffic is unaffected by this rule.
-		rules = append(rules, v2rayRule{
-			Type:        "field",
-			InboundTag:  []string{"vmess-in"},
-			Network:     "tcp,udp",
-			OutboundTag: "block",
-		})
-		routing = &v2rayRouting{DomainStrategy: "AsIs", Rules: rules}
-	}
-
-	// VMess inbound (always enabled)
-	vmessClients := make([]v2rayVMessClient, 0, len(accounts))
+	// Per-user routing: "user" field matches VMess client by email (<user>@kyle-proxy).
+	// Every rule must have at least one matcher besides outboundTag (v2ray 5.x).
+	var rules []v2rayRule
 	for _, a := range accounts {
-		vmessClients = append(vmessClients, v2rayVMessClient{
-			ID:      a.VMessUUID,
-			Email:   a.Username + "@kyle-proxy",
-			AlterId: 0,
-		})
+		email := a.Username + "@kyle-proxy"
+		if len(a.Patterns) > 0 {
+			domains := make([]string, len(a.Patterns))
+			for i, p := range a.Patterns {
+				domains[i] = "regexp:" + p
+			}
+			// allow matched domains → direct
+			rules = append(rules, v2rayRule{
+				Type: "field", User: []string{email}, Domain: domains, OutboundTag: "direct",
+			})
+			// block everything else (network:"tcp,udp" = valid catch-all for v2ray 5.x)
+			rules = append(rules, v2rayRule{
+				Type: "field", User: []string{email}, Network: "tcp,udp", OutboundTag: "block",
+			})
+		} else {
+			// no restriction: allow all
+			rules = append(rules, v2rayRule{
+				Type: "field", User: []string{email}, Network: "tcp,udp", OutboundTag: "direct",
+			})
+		}
 	}
-	// add a default VMess client if no users configured (for backward compat)
-	if len(vmessClients) == 0 {
-		vmessClients = append(vmessClients, v2rayVMessClient{
-			ID:      "00000000-0000-0000-0000-000000000000",
-			Email:   "default@kyle-proxy",
-			AlterId: 0,
-		})
-	}
+	// Safety net: block any VMess connection with an unknown/unregistered UUID.
+	rules = append(rules, v2rayRule{
+		Type: "field", InboundTag: []string{"vmess-in"}, Network: "tcp,udp", OutboundTag: "block",
+	})
 
 	return v2rayConfig{
 		Log: v2rayLog{LogLevel: "warning"},
 		Inbounds: []v2rayInbound{
-			{Port: cfg.HTTPPort, Listen: "0.0.0.0", Protocol: "http", Tag: "http-in",
-				Settings: httpSettings, Sniffing: sniff},
-			{Port: cfg.Socks5Port, Listen: "0.0.0.0", Protocol: "socks", Tag: "socks-in",
-				Settings: socksSettings, Sniffing: sniff},
 			{Port: cfg.VMessPort, Listen: "0.0.0.0", Protocol: "vmess", Tag: "vmess-in",
-			Settings: v2rayVMessSettings{Clients: vmessClients}, Sniffing: sniff},
+				Settings: v2rayVMessSettings{Clients: vmessClients}, Sniffing: sniff},
 		},
 		Outbounds: outbounds,
-		DNS:       v2rayDNS{Servers: []string{"8.8.8.8", "1.1.1.1", "localhost"}},
-		Routing:   routing,
+		DNS:       dns,
+		Routing:   &v2rayRouting{DomainStrategy: "AsIs", Rules: rules},
 	}
 }

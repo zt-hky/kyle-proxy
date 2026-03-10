@@ -29,9 +29,10 @@ type VPNConfig struct {
 
 // ProxyConfig stores v2ray proxy settings
 type ProxyConfig struct {
-	HTTPPort   int `json:"http_port"`
-	Socks5Port int `json:"socks5_port"`
-	VMessPort  int `json:"vmess_port"` // VMess inbound port for v2box/v2ray clients
+	HTTPPort   int    `json:"http_port"`
+	Socks5Port int    `json:"socks5_port"`
+	VMessPort  int    `json:"vmess_port"`   // VMess inbound port for v2box/v2ray clients
+	ServerHost string `json:"server_host,omitempty"` // public IP/hostname used in vmess:// links
 }
 
 // Default returns a config with sensible defaults

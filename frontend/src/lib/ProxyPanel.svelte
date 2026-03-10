@@ -48,70 +48,116 @@
         </div>
       </div>
 
-      <div class="info-item">
-        <span class="info-label">HTTP Proxy</span>
-        <div class="copy-row">
-          <code>{proxyInfo.host_ip}:{proxyInfo.http_port}</code>
-          <button class="btn-copy" on:click={() => copy(proxyInfo.host_ip + ':' + proxyInfo.http_port, 'http')}>
-            {copied === 'http' ? '✓' : '📋'}
-          </button>
+      {#if proxyInfo.auth_mode}
+        <!-- VMess-only mode -->
+        <div class="info-item">
+          <span class="info-label">VMess Port</span>
+          <div class="copy-row">
+            <code>{proxyInfo.host_ip}:{proxyInfo.vmess_port}</code>
+            <button class="btn-copy" on:click={() => copy(proxyInfo.host_ip + ':' + proxyInfo.vmess_port, 'vmess')}>
+              {copied === 'vmess' ? '✓' : '📋'}
+            </button>
+          </div>
         </div>
-      </div>
-
-      <div class="info-item">
-        <span class="info-label">SOCKS5 Proxy</span>
-        <div class="copy-row">
-          <code>{proxyInfo.host_ip}:{proxyInfo.socks5_port}</code>
-          <button class="btn-copy" on:click={() => copy(proxyInfo.host_ip + ':' + proxyInfo.socks5_port, 'socks')}>
-            {copied === 'socks' ? '✓' : '📋'}
-          </button>
+        <div class="info-item">
+          <span class="info-label">Per-user PAC</span>
+          <div class="copy-row">
+            <code>{proxyInfo.host_ip}:8888/pac/&lt;username&gt;</code>
+          </div>
         </div>
-      </div>
-
-      <div class="info-item">
-        <span class="info-label">PAC URL (Auto-Config)</span>
-        <div class="copy-row">
-          <code>{proxyInfo.pac_url}</code>
-          <button class="btn-copy" on:click={() => copy(proxyInfo.pac_url, 'pac')}>
-            {copied === 'pac' ? '✓' : '📋'}
-          </button>
+        <div class="auth-note">
+          🔒 HTTP/SOCKS5 disabled — clients must use <strong>VMess</strong> with UUID auth.<br>
+          Get your vmess:// link &amp; QR code from the <strong>🔐 Users</strong> tab.
         </div>
-      </div>
+      {:else}
+        <!-- Open proxy mode -->
+        <div class="info-item">
+          <span class="info-label">HTTP Proxy</span>
+          <div class="copy-row">
+            <code>{proxyInfo.host_ip}:{proxyInfo.http_port}</code>
+            <button class="btn-copy" on:click={() => copy(proxyInfo.host_ip + ':' + proxyInfo.http_port, 'http')}>
+              {copied === 'http' ? '✓' : '📋'}
+            </button>
+          </div>
+        </div>
+        <div class="info-item">
+          <span class="info-label">SOCKS5 Proxy</span>
+          <div class="copy-row">
+            <code>{proxyInfo.host_ip}:{proxyInfo.socks5_port}</code>
+            <button class="btn-copy" on:click={() => copy(proxyInfo.host_ip + ':' + proxyInfo.socks5_port, 'socks')}>
+              {copied === 'socks' ? '✓' : '📋'}
+            </button>
+          </div>
+        </div>
+        <div class="info-item">
+          <span class="info-label">PAC URL (Auto-Config)</span>
+          <div class="copy-row">
+            <code>{proxyInfo.pac_url}</code>
+            <button class="btn-copy" on:click={() => copy(proxyInfo.pac_url, 'pac')}>
+              {copied === 'pac' ? '✓' : '📋'}
+            </button>
+          </div>
+        </div>
+      {/if}
     </div>
   {:else}
     <p style="color:#64748b">Loading proxy info…</p>
   {/if}
 </div>
 
-<!-- iPhone setup guide -->
+<!-- Device setup guide -->
 <div class="card">
-  <h3>📱 iPhone Setup Guide</h3>
-  <ol class="steps">
-    <li>
-      <strong>Method 1 — Manual HTTP proxy</strong>
-      <ul>
-        <li>Settings → Wi-Fi → tap your network → Configure Proxy</li>
-        <li>Select <b>Manual</b></li>
-        <li>Server: <code>{proxyInfo?.host_ip ?? '&lt;server-ip&gt;'}</code></li>
-        <li>Port: <code>{proxyInfo?.http_port ?? 8080}</code></li>
-      </ul>
-    </li>
-    <li>
-      <strong>Method 2 — Auto (PAC file, recommended)</strong>
-      <ul>
-        <li>Settings → Wi-Fi → tap your network → Configure Proxy</li>
-        <li>Select <b>Auto</b></li>
-        <li>URL: <code>{proxyInfo?.pac_url ?? 'http://&lt;server-ip&gt;:8888/pac'}</code></li>
-      </ul>
-    </li>
-    <li>
-      <strong>Method 3 — SOCKS5</strong>
-      <ul>
-        <li>Use an app like Shadowrocket or Quantumult X</li>
-        <li>Add SOCKS5 server: <code>{proxyInfo?.host_ip ?? '&lt;server-ip&gt;'}</code>:<code>{proxyInfo?.socks5_port ?? 1080}</code></li>
-      </ul>
-    </li>
-  </ol>
+  <h3>📱 Device Setup Guide</h3>
+
+  {#if proxyInfo?.auth_mode}
+    <!-- VMess-only mode -->
+    <ol class="steps">
+      <li>
+        <strong>Method 1 — v2box / v2rayNG (recommended)</strong>
+        <ul>
+          <li>Install <b>v2box</b> (iOS App Store) or <b>v2rayNG</b> (Android Play Store)</li>
+          <li>Open the <b>🔐 Users</b> tab in this panel</li>
+          <li>Click <b>📲 VMess</b> next to your user — scan QR or copy the vmess:// link</li>
+          <li>Or click <b>⬇️ v2ray config</b> to get a full config with split-tunnel routing</li>
+        </ul>
+      </li>
+      <li>
+        <strong>Method 2 — Per-user PAC (auto-proxy, limited)</strong>
+        <ul>
+          <li>Settings → Wi-Fi → your network → Configure Proxy → Auto</li>
+          <li>URL: <code>{proxyInfo?.host_ip ?? '&lt;server&gt;'}:8888/pac/&lt;your-username&gt;</code></li>
+        </ul>
+      </li>
+    </ol>
+  {:else}
+    <!-- Open proxy mode -->
+    <ol class="steps">
+      <li>
+        <strong>Method 1 — Manual HTTP proxy</strong>
+        <ul>
+          <li>Settings → Wi-Fi → tap your network → Configure Proxy</li>
+          <li>Select <b>Manual</b></li>
+          <li>Server: <code>{proxyInfo?.host_ip ?? '&lt;server-ip&gt;'}</code></li>
+          <li>Port: <code>{proxyInfo?.http_port ?? 8080}</code></li>
+        </ul>
+      </li>
+      <li>
+        <strong>Method 2 — Auto (PAC file, recommended)</strong>
+        <ul>
+          <li>Settings → Wi-Fi → tap your network → Configure Proxy</li>
+          <li>Select <b>Auto</b></li>
+          <li>URL: <code>{proxyInfo?.pac_url ?? 'http://&lt;server-ip&gt;:8888/pac'}</code></li>
+        </ul>
+      </li>
+      <li>
+        <strong>Method 3 — SOCKS5</strong>
+        <ul>
+          <li>Use an app like Shadowrocket or Quantumult X</li>
+          <li>Add SOCKS5 server: <code>{proxyInfo?.host_ip ?? '&lt;server-ip&gt;'}</code>:<code>{proxyInfo?.socks5_port ?? 1080}</code></li>
+        </ul>
+      </li>
+    </ol>
+  {/if}
 </div>
 
 <style>
@@ -160,4 +206,14 @@
   .steps li { margin-bottom: 14px; }
   .steps ul { padding-left: 16px; margin-top: 4px; }
   .steps code { background: #0f172a; padding: 1px 6px; border-radius: 4px; color: #a5b4fc; font-size: 12px; }
+  .auth-note {
+    background: #1e293b;
+    border: 1px solid #6366f1;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: #c7d2fe;
+    line-height: 1.6;
+    margin-top: 4px;
+  }
 </style>

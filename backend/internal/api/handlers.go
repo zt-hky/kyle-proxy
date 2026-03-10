@@ -69,6 +69,8 @@ type configResponse struct {
 	ExtraArgs  []string `json:"extra_args"`
 	HTTPPort   int      `json:"http_port"`
 	Socks5Port int      `json:"socks5_port"`
+	VMessPort  int      `json:"vmess_port"`
+	ServerHost string   `json:"server_host"`
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
@@ -77,6 +79,7 @@ func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
 		HasPass: cfg.VPN.Password != "", CertFile: cfg.VPN.CertFile, TrustCert: cfg.VPN.TrustCert,
 		ExtraArgs: cfg.VPN.ExtraArgs, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
+		VMessPort: cfg.Proxy.VMessPort, ServerHost: cfg.Proxy.ServerHost,
 	})
 }
 
@@ -90,6 +93,8 @@ type updateConfigRequest struct {
 	ExtraArgs  []string `json:"extra_args"`
 	HTTPPort   int      `json:"http_port"`
 	Socks5Port int      `json:"socks5_port"`
+	VMessPort  int      `json:"vmess_port"`
+	ServerHost string   `json:"server_host"`
 }
 
 func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -116,13 +121,19 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Socks5Port > 0 {
 		cfg.Proxy.Socks5Port = req.Socks5Port
 	}
+	if req.VMessPort > 0 {
+		cfg.Proxy.VMessPort = req.VMessPort
+	}
+	cfg.Proxy.ServerHost = req.ServerHost // allow setting or clearing
 	if err := h.cfgMgr.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return
 	}
-	if req.HTTPPort > 0 || req.Socks5Port > 0 {
+	if req.HTTPPort > 0 || req.Socks5Port > 0 || req.VMessPort > 0 {
 		go func() {
-			_ = h.proxyMgr.UpdateConfig(proxy.Config{HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port})
+			_ = h.proxyMgr.UpdateConfig(proxy.Config{
+				HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port, VMessPort: cfg.Proxy.VMessPort,
+			})
 		}()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
@@ -169,6 +180,9 @@ func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
 	host := getOutboundIP()
 	if rh, _, err := net.SplitHostPort(r.Host); err == nil && rh != "" {
 		host = rh
+	}
+	if sh := cfg.Proxy.ServerHost; sh != "" {
+		host = sh // user-configured public host takes priority
 	}
 	vMessPort := h.proxyMgr.GetVMessPort()
 	hasUsers := len(h.userStore.ListUsers()) > 0
