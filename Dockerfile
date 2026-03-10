@@ -28,17 +28,20 @@ RUN npm run build
 # ── 2. Build Go binary ───────────────────────────────────────────────────────
 FROM golang:1.25-alpine AS go-builder
 WORKDIR /app/backend
-# go.mod/go.sum first — cached until deps change
+# go.mod/go.sum first — cached until deps change.
+# NOTE: intentionally NO --mount=type=cache here so downloaded modules are
+# written into the Docker layer and persisted in the GHCR registry cache.
+# A cache-mount would make this layer empty, causing every CI run to
+# re-download all modules (especially slow under arm64/QEMU emulation).
 COPY backend/go.mod backend/go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 # Source + compiled frontend (static files embedded in the binary)
 COPY backend/ ./
 COPY --from=node-builder /app/backend/static ./static
-# --mount=type=cache reuses compiled packages across incremental rebuilds
+# Only the go-build cache (compiled packages) uses a cache mount — it is safe
+# because it does not affect module resolution, only reuses pre-compiled pkgs.
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o kyle-proxy .
 
