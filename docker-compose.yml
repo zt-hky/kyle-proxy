@@ -1,0 +1,58 @@
+services:
+  kyle-proxy:
+    image: kyle-proxy:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # To build for ARM64 (TV Box):
+      #   docker buildx build --platform linux/arm64 -t kyle-proxy:arm64 .
+    container_name: kyle-proxy
+    restart: unless-stopped
+
+    ports:
+      - "8888:8888"   # Web management UI
+      - "8080:8080"   # HTTP proxy  → set on iPhone as HTTP proxy
+      - "1080:1080"   # SOCKS5 proxy
+
+    # ── Required for VPN/TUN ─────────────────────────────────────────────────
+    cap_add:
+      - NET_ADMIN   # allows creating TUN interfaces and modifying routing
+      - SYS_PTRACE  # allows gpclient to inspect its own process
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+
+    # ── Persistent data ──────────────────────────────────────────────────────
+    volumes:
+      - kyle-proxy-data:/data
+      # Optional: mount your own certs directory
+      # - ./certs:/data/certs:ro
+
+    environment:
+      - CONFIG_PATH=/data/config.json
+      - LISTEN_ADDR=:8888
+      # Optional: pre-configure VPN (can also be set via the web UI)
+      # - GP_PORTAL=vpn.company.com
+      # - GP_USERNAME=user@company.com
+
+    # ── Resource limits (for TV box: 2 GB RAM / 4 cores) ────────────────────
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "2"
+        reservations:
+          memory: 64M
+
+    # ── Health check ─────────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8888/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  kyle-proxy-data:
+    driver: local

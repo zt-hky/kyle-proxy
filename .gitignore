@@ -1,0 +1,18 @@
+.DS_Store
+*.local
+
+# Go
+backend/kyle-proxy
+backend/vendor/
+
+# Node / Svelte build output
+frontend/node_modules/
+frontend/dist/
+backend/static/
+
+# Docker
+*.env
+
+# Data volume (local dev)
+data/
+certs/
