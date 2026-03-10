@@ -49,10 +49,20 @@ export const api = {
     const q = host ? `?host=${encodeURIComponent(host)}` : ''
     return request('GET', `/api/users/${id}/vmess${q}`)
   },
-  // Returns a full v2ray client config JSON with built-in split-tunnel routing rules
-  getV2RayClientConfig: (id, host) => {
+  // Returns the raw JSON bytes of a v2ray client config (Content-Disposition: attachment)
+  // Use getV2RayClientConfigUrl for direct <a href> downloads.
+  getV2RayClientConfig: async (id, host) => {
     const q = host ? `?host=${encodeURIComponent(host)}` : ''
-    return request('GET', `/api/users/${id}/v2ray-config${q}`)
+    const res = await fetch(BASE + `/api/users/${id}/v2ray-config${q}`)
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }))
+      throw new Error(err.error || res.statusText)
+    }
+    return res.text() // already pretty-printed JSON from the server
+  },
+  getV2RayClientConfigUrl: (id, host) => {
+    const q = host ? `?host=${encodeURIComponent(host)}` : ''
+    return `${BASE}/api/users/${id}/v2ray-config${q}`
   },
 
   // ── Groups ────────────────────────────────────────────────────────────────

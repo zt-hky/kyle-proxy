@@ -126,14 +126,20 @@
     setTimeout(() => (vmessCopied = false), 2000)
   }
 
+  // downloadClientConfig fetches the ready-to-import v2ray JSON config from the
+  // server and triggers a browser file-save dialog.  The server returns the file
+  // with Content-Disposition: attachment so navigating to the URL directly also
+  // works without this JS helper.
   async function downloadClientConfig() {
     if (!vmessModal) return
     try {
-      const cfg = await api.getV2RayClientConfig(vmessModal.id)
-      const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
+      // api.getV2RayClientConfig now returns the raw pretty-printed JSON string
+      // (res.text()) so we don't double-serialise.
+      const text = await api.getV2RayClientConfig(vmessModal.id)
+      const blob = new Blob([text], { type: 'application/json' })
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
       a.download = `v2ray-${vmessModal.username}.json`
       document.body.appendChild(a)
       a.click()
