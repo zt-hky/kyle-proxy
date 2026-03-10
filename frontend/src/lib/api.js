@@ -51,8 +51,11 @@ export const api = {
   },
   // Returns the raw JSON bytes of a v2ray client config (Content-Disposition: attachment)
   // Use getV2RayClientConfigUrl for direct <a href> downloads.
-  getV2RayClientConfig: async (id, host) => {
-    const q = host ? `?host=${encodeURIComponent(host)}` : ''
+  getV2RayClientConfig: async (id, host, port) => {
+    const p = new URLSearchParams()
+    if (host) p.set('host', host)
+    if (port) p.set('port', String(port))
+    const q = p.toString() ? '?' + p.toString() : ''
     const res = await fetch(BASE + `/api/users/${id}/v2ray-config${q}`)
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }))
@@ -60,8 +63,11 @@ export const api = {
     }
     return res.text() // already pretty-printed JSON from the server
   },
-  getV2RayClientConfigUrl: (id, host) => {
-    const q = host ? `?host=${encodeURIComponent(host)}` : ''
+  getV2RayClientConfigUrl: (id, host, port) => {
+    const p = new URLSearchParams()
+    if (host) p.set('host', host)
+    if (port) p.set('port', String(port))
+    const q = p.toString() ? '?' + p.toString() : ''
     return `${BASE}/api/users/${id}/v2ray-config${q}`
   },
 

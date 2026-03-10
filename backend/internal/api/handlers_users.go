@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -183,7 +184,7 @@ func (h *Handler) handleVMessExport(w http.ResponseWriter, r *http.Request) {
 //   - Routing rules that implement split-tunnel (only group-pattern domains
 //     are sent through the proxy; everything else is DIRECT).
 //
-// GET /api/users/{id}/v2ray-config?host=<override-host>
+// GET /api/users/{id}/v2ray-config?host=<override-host>&port=<override-port>
 func (h *Handler) handleV2RayClientConfig(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	u, err := h.userStore.GetUser(id)
@@ -200,6 +201,11 @@ func (h *Handler) handleV2RayClientConfig(w http.ResponseWriter, r *http.Request
 		host = getOutboundIP()
 	}
 	port := h.proxyMgr.GetVMessPort()
+	if ps := r.URL.Query().Get("port"); ps != "" {
+		if p, err2 := strconv.Atoi(ps); err2 == nil && p > 0 && p < 65536 {
+			port = p
+		}
+	}
 	patterns := h.userStore.GetUserPatterns(u.Username)
 
 	clientCfg := proxy.BuildClientConfig(u.VMessUUID, u.Username, host, port, patterns)

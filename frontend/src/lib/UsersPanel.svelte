@@ -28,6 +28,9 @@
   // VMess modal
   let vmessModal = null // { id, link, host, port, uuid, username }
   let vmessCopied = false
+  let configHost = ''
+  let configPort = ''
+  let configJsonCopied = false
   let qrDataUrl = ''
 
   // ── Data loading ────────────────────────────────────────────────────────────
@@ -109,6 +112,9 @@
       const data = await api.getVMessExport(u.id)
       vmessModal = { ...data, id: u.id }
       vmessCopied = false
+      configJsonCopied = false
+      configHost = data.host || ''
+      configPort = data.port || ''
       qrDataUrl = ''
       QRCode.toDataURL(data.vmess_link, {
         width: 220, margin: 2,
@@ -130,21 +136,31 @@
   // server and triggers a browser file-save dialog.  The server returns the file
   // with Content-Disposition: attachment so navigating to the URL directly also
   // works without this JS helper.
-  async function downloadClientConfig() {
-    if (!vmessModal) return
+  async function downloadClientConfig(id = vmessModal?.id, username = vmessModal?.username) {
+    if (!id || !username) return
     try {
-      // api.getV2RayClientConfig now returns the raw pretty-printed JSON string
-      // (res.text()) so we don't double-serialise.
-      const text = await api.getV2RayClientConfig(vmessModal.id)
+      const text = await api.getV2RayClientConfig(id, configHost, configPort)
       const blob = new Blob([text], { type: 'application/json' })
       const url  = URL.createObjectURL(blob)
       const a    = document.createElement('a')
       a.href     = url
-      a.download = `v2ray-${vmessModal.username}.json`
+      a.download = `v2ray-${username}.json`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
+    } catch (e) {
+      toast(e.message, 'error')
+    }
+  }
+
+  async function copyConfigJson() {
+    if (!vmessModal) return
+    try {
+      const text = await api.getV2RayClientConfig(vmessModal.id, configHost, configPort)
+      await navigator.clipboard.writeText(text)
+      configJsonCopied = true
+      setTimeout(() => (configJsonCopied = false), 2000)
     } catch (e) {
       toast(e.message, 'error')
     }
@@ -271,6 +287,7 @@
               </td>
               <td class="actions">
                 <button class="btn-sm" on:click={() => showVMess(u)} title="Export VMess link">📲 VMess</button>
+                <button class="btn-sm" on:click={() => downloadClientConfig(u.id, u.username)} title="Download v2ray client config JSON">⬇️ Config</button>
                 <button class="btn-sm btn-edit" on:click={() => openEditUser(u)}>✏️ Edit</button>
                 <button class="btn-sm btn-danger" on:click={() => deleteUser(u)}>🗑</button>
               </td>
@@ -459,10 +476,22 @@
         <span>UUID: <code>{vmessModal.uuid}</code></span>
       </div>
 
+      <div class="config-override">
+        <label class="override-label">🛠 Override host / port for config file</label>
+        <div class="override-row">
+          <input type="text" bind:value={configHost} placeholder="hostname or IP" />
+          <input type="number" class="port-input" bind:value={configPort} placeholder="port" min="1" max="65535" />
+        </div>
+      </div>
+
       <div class="modal-actions">
         <button class="btn-primary" on:click={copyVMess}>
-          {vmessCopied ? '✅ Copied!' : '📋 Copy vmess:// link'}
+          {vmessCopied ? '✅ Copied!' : '📋 Copy vmess://'}
         </button>
+        <button class="btn-primary" on:click={copyConfigJson}>
+          {configJsonCopied ? '✅ Copied!' : '📋 Copy JSON'}
+        </button>
+        <button class="btn-primary" on:click={() => downloadClientConfig()}>⬇️ Download JSON</button>
         <button on:click={() => (vmessModal = null)}>Close</button>
       </div>
     </div>
@@ -529,6 +558,11 @@
   .vmess-box { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; margin: 12px 0; overflow-x: auto; }
   .vmess-link { font-size: 11px; word-break: break-all; color: #a5b4fc; }
   .vmess-meta { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: #94a3b8; }
+  .config-override { margin-top: 14px; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; }
+  .override-label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 8px; }
+  .override-row { display: flex; gap: 8px; }
+  .override-row input { flex: 1; }
+  .port-input { width: 90px; flex: none !important; }
   .vmess-meta code { color: #e2e8f0; }
   .qr-wrap { display: flex; flex-direction: column; align-items: center; margin: 10px 0; }
   .qr-img { width: 200px; height: 200px; image-rendering: pixelated; border-radius: 8px; background: #fff; }
