@@ -242,7 +242,7 @@ type v2rayInbound struct {
 	Protocol string      `json:"protocol"`
 	Tag      string      `json:"tag"`
 	Settings interface{} `json:"settings"`
-	Sniffing v2raySniff  `json:"sniffing,omitempty"`
+	Sniffing *v2raySniff `json:"sniffing,omitempty"`
 }
 
 // HTTP inbound settings (no auth)
@@ -317,6 +317,8 @@ type v2rayRule struct {
 	Type        string   `json:"type"`
 	User        []string `json:"user,omitempty"`
 	Domain      []string `json:"domain,omitempty"`
+	Network     string   `json:"network,omitempty"` // e.g. "tcp,udp" for catch-all
+	InboundTag  []string `json:"inboundTag,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
 
@@ -335,7 +337,7 @@ type v2rayDNS struct {
 //
 // When accounts is empty → backward-compat open proxy (no auth).
 func buildV2RayConfig(cfg Config, accounts []UserAccount) v2rayConfig {
-	sniff := v2raySniff{Enabled: true, DestOverride: []string{"http", "tls"}}
+	sniff := &v2raySniff{Enabled: true, DestOverride: []string{"http", "tls"}}
 
 	var httpSettings interface{}
 	var socksSettings interface{}
@@ -364,39 +366,56 @@ func buildV2RayConfig(cfg Config, accounts []UserAccount) v2rayConfig {
 		bh.Response.Type = "http"
 		outbounds = append(outbounds, v2rayOutbound{Protocol: "blackhole", Tag: "block", Settings: bh})
 
-		// Build routing rules per user
+		// Build VMess routing rules per user.
+		// NOTE: The "user" field in v2ray routing matches VMess client email only,
+		// not HTTP/SOCKS5 usernames. HTTP/SOCKS5 per-user filtering is handled by
+		// PAC files served at /pac/{username}.
+		// Every rule MUST have at least one effective match condition; a bare
+		// outboundTag-only rule is rejected by v2ray 5.x with
+		// "this rule has no effective fields".
 		var rules []v2rayRule
 		for _, a := range accounts {
+			// VMess email is "<username>@kyle-proxy" — set in the VMess client config
+			email := a.Username + "@kyle-proxy"
 			if len(a.Patterns) > 0 {
 				// domain-prefixed patterns for v2ray regexp matching
 				domains := make([]string, len(a.Patterns))
 				for i, p := range a.Patterns {
 					domains[i] = "regexp:" + p
 				}
-				// allow matched patterns
+				// allow matched domains for this VMess user
 				rules = append(rules, v2rayRule{
 					Type:        "field",
-					User:        []string{a.Username},
+					User:        []string{email},
 					Domain:      domains,
 					OutboundTag: "direct",
 				})
-				// block everything else for this user
+				// block everything else for this VMess user
+				// network:"tcp,udp" is the catch-all condition (required by v2ray 5.x)
 				rules = append(rules, v2rayRule{
 					Type:        "field",
-					User:        []string{a.Username},
+					User:        []string{email},
+					Network:     "tcp,udp",
 					OutboundTag: "block",
 				})
 			} else {
-				// no restriction: allow all
+				// no restriction: allow all traffic for this VMess user
 				rules = append(rules, v2rayRule{
 					Type:        "field",
-					User:        []string{a.Username},
+					User:        []string{email},
+					Network:     "tcp,udp",
 					OutboundTag: "direct",
 				})
 			}
 		}
-		// default rule: block unauthenticated
-		rules = append(rules, v2rayRule{Type: "field", OutboundTag: "block"})
+		// Default catch-all: block any remaining (unauthenticated) VMess traffic.
+		// Scoped to vmess-in so HTTP/SOCKS5 traffic is unaffected by this rule.
+		rules = append(rules, v2rayRule{
+			Type:        "field",
+			InboundTag:  []string{"vmess-in"},
+			Network:     "tcp,udp",
+			OutboundTag: "block",
+		})
 		routing = &v2rayRouting{DomainStrategy: "AsIs", Rules: rules}
 	}
 
@@ -426,7 +445,7 @@ func buildV2RayConfig(cfg Config, accounts []UserAccount) v2rayConfig {
 			{Port: cfg.Socks5Port, Listen: "0.0.0.0", Protocol: "socks", Tag: "socks-in",
 				Settings: socksSettings, Sniffing: sniff},
 			{Port: cfg.VMessPort, Listen: "0.0.0.0", Protocol: "vmess", Tag: "vmess-in",
-				Settings: v2rayVMessSettings{Clients: vmessClients}},
+			Settings: v2rayVMessSettings{Clients: vmessClients}, Sniffing: sniff},
 		},
 		Outbounds: outbounds,
 		DNS:       v2rayDNS{Servers: []string{"8.8.8.8", "1.1.1.1", "localhost"}},
