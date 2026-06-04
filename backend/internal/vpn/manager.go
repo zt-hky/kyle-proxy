@@ -35,29 +35,36 @@ type ConnectRequest struct {
 	Username  string `json:"username"`
 	Password  string `json:"password"`
 	OTP       string `json:"otp"`
+	OTP2      string `json:"otp2"`
 	CertFile  string `json:"cert_file"`
 	TrustCert bool   `json:"trust_cert"` // fetch server cert and pass via --cafile (openconnect v9+)
 }
 
 // Status is returned by GetStatus()
 type Status struct {
-	State     State  `json:"state"`
-	IP        string `json:"ip,omitempty"`
-	Interface string `json:"interface,omitempty"`
-	Error     string `json:"error,omitempty"`
-	Since     string `json:"since,omitempty"`
+	State          State  `json:"state"`
+	IP             string `json:"ip,omitempty"`
+	Interface      string `json:"interface,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Since          string `json:"since,omitempty"`
+	AwaitingOTP    bool   `json:"awaiting_otp,omitempty"`
+	OTPPromptCount int    `json:"otp_prompt_count,omitempty"`
 }
 
 // Manager manages the VPN lifecycle using gpclient
 type Manager struct {
-	mu            sync.RWMutex
-	state         State
-	errorMsg      string
-	cmd           *exec.Cmd
-	logs          []string
-	connectedAt   time.Time
-	tunInterface  string
-	onStateChange func(State)
+	mu                sync.RWMutex
+	state             State
+	errorMsg          string
+	cmd               *exec.Cmd
+	stdin             io.WriteCloser
+	logs              []string
+	connectedAt       time.Time
+	tunInterface      string
+	awaitingOTP       bool
+	otpPromptCount    int
+	authResponsesSent int
+	onStateChange     func(State)
 }
 
 // NewManager creates a new VPN manager
@@ -81,9 +88,11 @@ func (m *Manager) GetStatus() Status {
 	defer m.mu.RUnlock()
 
 	s := Status{
-		State:    m.state,
-		Error:    m.errorMsg,
-		Interface: m.tunInterface,
+		State:          m.state,
+		Error:          m.errorMsg,
+		Interface:      m.tunInterface,
+		AwaitingOTP:    m.awaitingOTP,
+		OTPPromptCount: m.otpPromptCount,
 	}
 
 	if m.state == StateConnected && !m.connectedAt.IsZero() {
@@ -126,6 +135,36 @@ func (m *Manager) Connect(req ConnectRequest) error {
 	return nil
 }
 
+// SubmitOTP sends a fresh MFA token to the currently-running openconnect process.
+func (m *Manager) SubmitOTP(otp string) error {
+	tokens := splitOTPValues(otp)
+	if len(tokens) == 0 {
+		return fmt.Errorf("OTP is required")
+	}
+
+	m.mu.Lock()
+	if m.state != StateConnecting {
+		m.mu.Unlock()
+		return fmt.Errorf("VPN is not awaiting authentication input")
+	}
+	stdin := m.stdin
+	if stdin == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("VPN authentication input is not available")
+	}
+	m.awaitingOTP = false
+	m.mu.Unlock()
+
+	for _, token := range tokens {
+		if _, err := fmt.Fprintf(stdin, "%s\n", token); err != nil {
+			return fmt.Errorf("send OTP: %w", err)
+		}
+		m.recordAuthResponse()
+	}
+	m.addLog(fmt.Sprintf("MFA: submitted %d OTP response(s)", len(tokens)))
+	return nil
+}
+
 // Disconnect terminates the VPN connection gracefully
 func (m *Manager) Disconnect() error {
 	m.mu.Lock()
@@ -141,6 +180,15 @@ func (m *Manager) Disconnect() error {
 	m.addLog("=== Disconnecting VPN ===")
 
 	if cmd != nil && cmd.Process != nil {
+		m.mu.Lock()
+		stdin := m.stdin
+		m.stdin = nil
+		m.awaitingOTP = false
+		m.mu.Unlock()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+
 		// Try graceful SIGTERM first
 		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			log.Printf("[VPN] SIGTERM failed, killing process: %v", err)
@@ -165,7 +213,11 @@ func (m *Manager) Disconnect() error {
 
 	m.mu.Lock()
 	m.cmd = nil
+	m.stdin = nil
 	m.tunInterface = ""
+	m.awaitingOTP = false
+	m.otpPromptCount = 0
+	m.authResponsesSent = 0
 	m.mu.Unlock()
 
 	m.setState(StateDisconnected, "")
@@ -235,23 +287,13 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 	cmd := exec.Command("openconnect", args...)
 	cmd.Env = os.Environ()
 
-	// Feed credentials via stdin:
-	//   Line 1 → password
-	//   Line 2 → OTP/token (only sent if OTP is non-empty; openconnect will
-	//             prompt for it automatically when the server requests MFA)
+	// Feed the password and any token supplied at connect time, then keep stdin
+	// open so later MFA prompts can be answered with SubmitOTP.
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
 	}
-	go func() {
-		defer stdinPipe.Close()
-		fmt.Fprintf(stdinPipe, "%s\n", req.Password)
-		if req.OTP != "" {
-			// Wait for server to respond to password and issue the OTP challenge
-			time.Sleep(1 * time.Second)
-			fmt.Fprintf(stdinPipe, "%s\n", req.OTP)
-		}
-	}()
+	inputLines := authInputLines(req)
 
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -262,7 +304,17 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 
 	m.mu.Lock()
 	m.cmd = cmd
+	m.stdin = stdinPipe
+	m.awaitingOTP = false
+	m.otpPromptCount = 0
+	m.authResponsesSent = 0
 	m.mu.Unlock()
+
+	if err := m.writeInitialAuth(stdinPipe, inputLines); err != nil {
+		_ = stdinPipe.Close()
+		m.clearProcessAuthState()
+		return err
+	}
 
 	// Stream stdout and stderr, detect state changes
 	var wg sync.WaitGroup
@@ -283,11 +335,14 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 		currentState := m.state
 		m.mu.RUnlock()
 		if currentState == StateDisconnecting || currentState == StateDisconnected {
+			m.clearProcessAuthState()
 			return nil
 		}
+		m.clearProcessAuthState()
 		return fmt.Errorf("gpclient exited: %w", err)
 	}
 
+	m.clearProcessAuthState()
 	m.setState(StateDisconnected, "")
 	return nil
 }
@@ -301,6 +356,9 @@ func (m *Manager) streamOutput(r io.Reader) {
 		log.Printf("[VPN] %s", line)
 
 		lower := strings.ToLower(line)
+		if isOTPPromptLine(lower) {
+			m.noteOTPPrompt()
+		}
 		switch {
 		case containsAny(lower, "connected", "tunnel is up", "established", "vpn connection established"):
 			iface := detectTunInterface()
@@ -323,6 +381,57 @@ func (m *Manager) streamOutput(r io.Reader) {
 			}
 		}
 	}
+}
+
+func (m *Manager) writeInitialAuth(stdin io.Writer, lines []string) error {
+	if len(lines) == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintf(stdin, "%s\n", lines[0]); err != nil {
+		return fmt.Errorf("send password: %w", err)
+	}
+	for _, token := range lines[1:] {
+		if _, err := fmt.Fprintf(stdin, "%s\n", token); err != nil {
+			return fmt.Errorf("send initial OTP: %w", err)
+		}
+		m.recordAuthResponse()
+	}
+	if len(lines) > 1 {
+		m.addLog(fmt.Sprintf("MFA: submitted %d initial OTP response(s)", len(lines)-1))
+	}
+	return nil
+}
+
+func (m *Manager) recordAuthResponse() {
+	m.mu.Lock()
+	m.authResponsesSent++
+	if m.authResponsesSent >= m.otpPromptCount {
+		m.awaitingOTP = false
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) noteOTPPrompt() {
+	m.mu.Lock()
+	m.otpPromptCount++
+	needsInput := m.authResponsesSent < m.otpPromptCount
+	if needsInput {
+		m.awaitingOTP = true
+	}
+	m.mu.Unlock()
+	if needsInput {
+		m.addLog(fmt.Sprintf("MFA: waiting for fresh OTP response #%d", m.otpPromptCount))
+	}
+}
+
+func (m *Manager) clearProcessAuthState() {
+	m.mu.Lock()
+	m.cmd = nil
+	m.stdin = nil
+	m.awaitingOTP = false
+	m.otpPromptCount = 0
+	m.authResponsesSent = 0
+	m.mu.Unlock()
 }
 
 // setState safely updates state and fires the callback
@@ -395,6 +504,40 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
+}
+
+func authInputLines(req ConnectRequest) []string {
+	lines := []string{req.Password}
+	return append(lines, otpInputs(req.OTP, req.OTP2)...)
+}
+
+func otpInputs(values ...string) []string {
+	inputs := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, token := range splitOTPValues(value) {
+			inputs = append(inputs, token)
+		}
+	}
+	return inputs
+}
+
+func isOTPPromptLine(lower string) bool {
+	return strings.Contains(lower, "otp") &&
+		(strings.Contains(lower, "enter") || strings.Contains(lower, "please") || strings.Contains(lower, "value"))
+}
+
+func splitOTPValues(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	tokens := make([]string, 0, len(parts))
+	for _, part := range parts {
+		token := strings.TrimSpace(part)
+		if token != "" {
+			tokens = append(tokens, token)
+		}
+	}
+	return tokens
 }
 
 // fetchServerCertPin dials host over TLS (skipping verification), grabs the leaf

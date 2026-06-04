@@ -98,6 +98,7 @@ FROM debian:bookworm-slim AS runtime
 # curl and unzip intentionally absent (downloads handled in the downloader stage).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         openconnect \
         iproute2 \
         iptables \

@@ -7,11 +7,15 @@
   const dispatch = createEventDispatcher()
 
   let otp = ''
+  let nextOtp = ''
   let loading = false
+  let otpLoading = false
 
   $: vpnState = status?.vpn?.state ?? 'disconnected'
   $: isConnected = vpnState === 'connected'
   $: isConnecting = vpnState === 'connecting' || vpnState === 'disconnecting'
+  $: awaitingOtp = Boolean(status?.vpn?.awaiting_otp)
+  $: otpPromptCount = status?.vpn?.otp_prompt_count ?? 0
   $: vpnIP = status?.vpn?.ip ?? ''
   $: vpnIface = status?.vpn?.interface ?? ''
   $: vpnSince = status?.vpn?.since ? new Date(status.vpn.since).toLocaleTimeString() : ''
@@ -26,6 +30,19 @@
       dispatch('toast', { msg: e.message, type: 'error' })
     } finally {
       loading = false
+    }
+  }
+
+  async function submitOtp() {
+    otpLoading = true
+    try {
+      await api.submitOtp(nextOtp)
+      nextOtp = ''
+      dispatch('toast', { msg: 'OTP submitted…', type: 'info' })
+    } catch (e) {
+      dispatch('toast', { msg: e.message, type: 'error' })
+    } finally {
+      otpLoading = false
     }
   }
 
@@ -72,7 +89,7 @@
     <div class="otp-row">
       <div class="form-row" style="flex:1">
         <label for="otp">OTP / 2FA Token (if required)</label>
-        <input id="otp" type="text" placeholder="123456" bind:value={otp} maxlength="12"
+        <input id="otp" type="text" placeholder="123456" bind:value={otp} maxlength="32"
                on:keydown={(e) => e.key === 'Enter' && connect()} />
       </div>
       <button class="btn-success" on:click={connect} disabled={loading}>
@@ -80,10 +97,23 @@
       </button>
     </div>
   {:else if isConnecting}
-    <div class="connecting-anim">
-      <span class="spinner"></span>
-      <span>{vpnState === 'disconnecting' ? 'Disconnecting…' : 'Establishing tunnel…'}</span>
-    </div>
+    {#if awaitingOtp}
+      <div class="otp-row">
+        <div class="form-row" style="flex:1">
+          <label for="next-otp">Fresh OTP for prompt #{otpPromptCount}</label>
+          <input id="next-otp" type="text" placeholder="wait for new code" bind:value={nextOtp} maxlength="12"
+                 on:keydown={(e) => e.key === 'Enter' && submitOtp()} />
+        </div>
+        <button class="btn-success" on:click={submitOtp} disabled={otpLoading || !nextOtp.trim()}>
+          {otpLoading ? '…' : 'Submit OTP'}
+        </button>
+      </div>
+    {:else}
+      <div class="connecting-anim">
+        <span class="spinner"></span>
+        <span>{vpnState === 'disconnecting' ? 'Disconnecting…' : 'Establishing tunnel…'}</span>
+      </div>
+    {/if}
   {:else}
     <button class="btn-danger" on:click={disconnect} disabled={loading}>
       {loading ? '…' : '🔓 Disconnect'}
@@ -131,6 +161,16 @@
     align-items: flex-end;
   }
   .otp-row button { flex-shrink: 0; height: 37px; }
+
+  @media (max-width: 640px) {
+    .otp-row {
+      align-items: stretch;
+      flex-direction: column;
+    }
+    .otp-row button {
+      width: 100%;
+    }
+  }
 
   .connecting-anim {
     display: flex;

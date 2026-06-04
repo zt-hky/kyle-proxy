@@ -48,6 +48,7 @@ func NewRouter(
 	r.Post("/api/config", h.handleUpdateConfig)
 
 	r.Post("/api/vpn/connect", h.handleConnect)
+	r.Post("/api/vpn/otp", h.handleVPNOTP)
 	r.Post("/api/vpn/disconnect", h.handleDisconnect)
 
 	r.Get("/api/logs", h.handleLogs)
@@ -111,4 +112,3 @@ func corsMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-

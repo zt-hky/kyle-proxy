@@ -48,8 +48,8 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 type statusResponse struct {
-	VPN   vpn.Status       `json:"vpn"`
-	Proxy proxyStatusExt   `json:"proxy"`
+	VPN   vpn.Status     `json:"vpn"`
+	Proxy proxyStatusExt `json:"proxy"`
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -140,7 +140,8 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 type connectRequest struct {
-	OTP string `json:"otp"`
+	OTP  string `json:"otp"`
+	OTP2 string `json:"otp2"`
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -153,13 +154,30 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.vpnMgr.Connect(vpn.ConnectRequest{
 		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
-		Password: cfg.VPN.Password, OTP: req.OTP, CertFile: cfg.VPN.CertFile,
+		Password: cfg.VPN.Password, OTP: req.OTP, OTP2: req.OTP2, CertFile: cfg.VPN.CertFile,
 		TrustCert: cfg.VPN.TrustCert,
 	}); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "connecting"})
+}
+
+type otpRequest struct {
+	OTP string `json:"otp"`
+}
+
+func (h *Handler) handleVPNOTP(w http.ResponseWriter, r *http.Request) {
+	var req otpRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if err := h.vpnMgr.SubmitOTP(req.OTP); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "submitted"})
 }
 
 func (h *Handler) handleDisconnect(w http.ResponseWriter, _ *http.Request) {
@@ -174,7 +192,6 @@ func (h *Handler) handleLogs(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]string{"lines": h.vpnMgr.GetLogs()})
 }
 
-
 func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfgMgr.Get()
 	host := getOutboundIP()
@@ -188,11 +205,11 @@ func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
 	hasUsers := len(h.userStore.ListUsers()) > 0
 	writeJSON(w, http.StatusOK, proxyInfoExtended{
 		HostIP: host, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
-		VMessPort:  vMessPort,
-		HTTPProxy:  fmt.Sprintf("http://%s:%d", host, cfg.Proxy.HTTPPort),
-		Socks5:     fmt.Sprintf("socks5://%s:%d", host, cfg.Proxy.Socks5Port),
-		PACUrl:     fmt.Sprintf("http://%s:8888/pac", host),
-		AuthMode:   hasUsers,
+		VMessPort: vMessPort,
+		HTTPProxy: fmt.Sprintf("http://%s:%d", host, cfg.Proxy.HTTPPort),
+		Socks5:    fmt.Sprintf("socks5://%s:%d", host, cfg.Proxy.Socks5Port),
+		PACUrl:    fmt.Sprintf("http://%s:8888/pac", host),
+		AuthMode:  hasUsers,
 	})
 }
 
@@ -255,12 +272,12 @@ func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
 	cfg.VPN.CertFile = certPath
 	_ = h.cfgMgr.Save(cfg)
 	installCmd := exec.Command("sh", "-c",
-fmt.Sprintf("cp %s /usr/local/share/ca-certificates/kyle-proxy-ca.crt && update-ca-certificates", certPath))
+		fmt.Sprintf("cp %s /usr/local/share/ca-certificates/kyle-proxy-ca.crt && update-ca-certificates", certPath))
 	if outBytes, err := installCmd.CombinedOutput(); err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{
-"status": "uploaded", "path": certPath,
-"warning": fmt.Sprintf("system trust install failed: %s", string(outBytes)),
-})
+			"status": "uploaded", "path": certPath,
+			"warning": fmt.Sprintf("system trust install failed: %s", string(outBytes)),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "uploaded", "path": certPath})

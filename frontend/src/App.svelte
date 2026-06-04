@@ -39,7 +39,7 @@
       window.location.href = api.authLoginUrl()
       return
     }
-    pollInterval = setInterval(poll, 3000)
+    pollInterval = setInterval(poll, 1000)
   })
 
   onDestroy(() => clearInterval(pollInterval))

@@ -20,7 +20,8 @@ export const api = {
   status:     () => request('GET', '/api/status'),
   getConfig:  () => request('GET', '/api/config'),
   saveConfig: (data) => request('POST', '/api/config', data),
-  connect:    (otp) => request('POST', '/api/vpn/connect', { otp }),
+  connect:    (otp, otp2 = '') => request('POST', '/api/vpn/connect', { otp, otp2 }),
+  submitOtp:  (otp) => request('POST', '/api/vpn/otp', { otp }),
   disconnect: () => request('POST', '/api/vpn/disconnect'),
   logs:       () => request('GET', '/api/logs'),
   proxyInfo:  () => request('GET', '/api/proxy/info'),
@@ -77,4 +78,3 @@ export const api = {
   updateGroup:  (id, data) => request('PUT', `/api/groups/${id}`, data),
   deleteGroup:  (id) => request('DELETE', `/api/groups/${id}`),
 }
-

@@ -229,7 +229,8 @@ volumes:
 | `GET` | `/api/status` | VPN + proxy status |
 | `GET` | `/api/config` | Get config |
 | `PUT` | `/api/config` | Save config |
-| `POST` | `/api/vpn/connect` | Connect — body: `{"otp":"123456"}` |
+| `POST` | `/api/vpn/connect` | Connect — body: `{"otp":"123456"}` for the first OTP |
+| `POST` | `/api/vpn/otp` | Submit a fresh OTP while connecting — body: `{"otp":"654321"}` |
 | `POST` | `/api/vpn/disconnect` | Disconnect |
 | `GET` | `/api/logs` | VPN log lines |
 | `GET` | `/api/proxy/info` | Proxy host/port/PAC info |
