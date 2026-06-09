@@ -20,7 +20,11 @@ export const api = {
   status:     () => request('GET', '/api/status'),
   getConfig:  () => request('GET', '/api/config'),
   saveConfig: (data) => request('POST', '/api/config', data),
-  connect:    (otp, otp2 = '') => request('POST', '/api/vpn/connect', { otp, otp2 }),
+  connect:    (otp, otp2 = '', autoReconnect = false) => request('POST', '/api/vpn/connect', {
+    otp,
+    otp2,
+    auto_reconnect: autoReconnect,
+  }),
   submitOtp:  (otp) => request('POST', '/api/vpn/otp', { otp }),
   disconnect: () => request('POST', '/api/vpn/disconnect'),
   logs:       () => request('GET', '/api/logs'),

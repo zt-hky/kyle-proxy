@@ -4,8 +4,9 @@
 #  Build stages (ordered for maximum layer-cache reuse):
 #    1. node-builder  — npm ci + vite build  (cache busted by package*.json / src)
 #    2. go-builder    — go mod download + go build  (cache busted by go.mod / src)
-#    3. downloader    — curl v2ray + gpclient  (cache busted by version ARGs only)
-#    4. runtime       — system deps -> versioned bins -> app binary
+#    3. openconnect-builder — build newer OpenConnect with GP HTML MFA fixes
+#    4. downloader    — curl v2ray + gpclient  (cache busted by version ARGs only)
+#    5. runtime       — system deps -> versioned bins -> app binary
 #
 #  Cache strategy:
 #    --mount=type=cache  -> speeds up local / self-hosted runner rebuilds
@@ -45,7 +46,45 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
     go build -ldflags="-s -w" -o kyle-proxy .
 
-# ── 3. Download external binaries ────────────────────────────────────────────
+# ── 3. Build OpenConnect with GlobalProtect HTML-wrapped MFA support ─────────
+# Debian Bookworm ships OpenConnect 9.01, which fails to parse some PAN
+# GlobalProtect gateway OTP challenges returned as HTML-wrapped JavaScript.
+# OpenConnect 9.12 includes the upstream GlobalProtect parser fix.
+FROM debian:bookworm-slim AS openconnect-builder
+ARG OPENCONNECT_VERSION=9.12
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        build-essential \
+        pkg-config \
+        libxml2-dev \
+        libgnutls28-dev \
+        libproxy-dev \
+        libp11-kit-dev \
+        libpcsclite-dev \
+        libstoken-dev \
+        liboath-dev \
+        liblz4-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    curl -fsSL -o /tmp/openconnect.tar.gz \
+        "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT_VERSION}.tar.gz"; \
+    mkdir -p /tmp/openconnect; \
+    tar -xzf /tmp/openconnect.tar.gz -C /tmp/openconnect --strip-components=1; \
+    cd /tmp/openconnect; \
+    ./configure \
+        --prefix=/usr/local \
+        --sbindir=/usr/local/bin \
+        --with-vpnc-script=/usr/share/vpnc-scripts/vpnc-script \
+        --disable-nls \
+        --without-openssl; \
+    make -j"$(nproc)"; \
+    make install; \
+    ldconfig; \
+    /usr/local/bin/openconnect --version
+
+# ── 4. Download external binaries ────────────────────────────────────────────
 # Isolated stage: slow network fetches only re-run when version ARGs change,
 # not on source-code changes. curl/unzip are NOT carried into the runtime image.
 FROM debian:bookworm-slim AS downloader
@@ -91,19 +130,37 @@ RUN set -eux; \
     find /tmp/gp -name "gpauth"   -exec install -m755 {} /dl/gpauth   \; ; \
     rm -rf /tmp/gp.tar.gz /tmp/gp
 
-# ── 4. Runtime image ──────────────────────────────────────────────────────────
+# ── 5. Runtime image ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
 # System packages — rarely change; first layer for maximum cache stability.
-# curl and unzip intentionally absent (downloads handled in the downloader stage).
+# curl is kept for health checks and in-container troubleshooting; downloads
+# for versioned tools still happen in isolated build stages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        openconnect \
         iproute2 \
+        iputils-ping \
         iptables \
+        libgnutls30 \
+        libhogweed6 \
+        liblz4-1 \
+        libnettle8 \
+        liboath0 \
+        libp11-kit0 \
+        libpcsclite1 \
+        libproxy1v5 \
+        libstoken1 \
+        libxml2 \
         procps \
+        vpnc-scripts \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
+
+# Newer OpenConnect built above. Keep it before distro paths in PATH by
+# installing into /usr/local/bin, and refresh the runtime linker cache.
+COPY --from=openconnect-builder /usr/local /usr/local
+RUN ldconfig && openconnect --version
 
 # Versioned binaries — layer invalidated only when V2RAY_VERSION / GP_VERSION change
 COPY --from=downloader /dl/v2ray    /usr/local/bin/v2ray

@@ -6,15 +6,19 @@
 
   let cfg = {
     portal: '', gateway: '', username: '', password: '',
+    otp_secret: '', clear_otp_secret: false, auto_reconnect: false,
     cert_file: '', trust_cert: false, extra_args: [],
     http_port: 8080, socks5_port: 1080,
     vmess_port: 8388, server_host: '',
   }
   let extraArgsStr = ''
   let hasPass = false
+  let hasOtpSecret = false
   let saving = false
   let certFile = null
   let uploadingCert = false
+
+  $: otpSecretAvailable = Boolean(hasOtpSecret || cfg.otp_secret.trim()) && !cfg.clear_otp_secret
 
   onMount(async () => {
     try {
@@ -24,6 +28,9 @@
         gateway: data.gateway ?? '',
         username: data.username ?? '',
         password: '',
+        otp_secret: '',
+        clear_otp_secret: false,
+        auto_reconnect: data.auto_reconnect ?? false,
         cert_file: data.cert_file ?? '',
         trust_cert: data.trust_cert ?? false,
         extra_args: data.extra_args ?? [],
@@ -33,6 +40,7 @@
         server_host: data.server_host ?? '',
       }
       hasPass = data.has_password ?? false
+      hasOtpSecret = data.has_otp_secret ?? false
       extraArgsStr = (data.extra_args ?? []).join(' ')
     } catch (e) {
       dispatch('toast', { msg: 'Failed to load config: ' + e.message, type: 'error' })
@@ -47,8 +55,18 @@
         extra_args: extraArgsStr.trim() ? extraArgsStr.trim().split(/\s+/) : [],
       }
       if (!payload.password) delete payload.password // don't overwrite with empty
+      if (!payload.otp_secret) delete payload.otp_secret // don't overwrite with empty
+      if (!otpSecretAvailable) payload.auto_reconnect = false
       await api.saveConfig(payload)
       if (cfg.password) hasPass = true
+      if (cfg.clear_otp_secret) {
+        hasOtpSecret = false
+        cfg.clear_otp_secret = false
+        cfg.auto_reconnect = false
+      } else if (cfg.otp_secret) {
+        hasOtpSecret = true
+        cfg.otp_secret = ''
+      }
       dispatch('toast', { msg: '✅ Configuration saved', type: 'success' })
     } catch (e) {
       dispatch('toast', { msg: 'Save failed: ' + e.message, type: 'error' })
@@ -98,6 +116,33 @@
     <input id="password" type="password"
            placeholder={hasPass ? '••••••••' : 'Enter password'}
            bind:value={cfg.password} />
+  </div>
+  <div class="form-row">
+    <label for="otpSecret">TOTP secret {hasOtpSecret ? '(saved — enter to update)' : '(optional)'}</label>
+    <input id="otpSecret" type="password"
+           placeholder={hasOtpSecret ? 'Saved TOTP key' : 'Base32 secret or otpauth:// URL'}
+           autocomplete="off"
+           disabled={cfg.clear_otp_secret}
+           bind:value={cfg.otp_secret} />
+  </div>
+  {#if hasOtpSecret}
+    <div class="form-row">
+      <label class="toggle-label compact-toggle">
+        <input type="checkbox" bind:checked={cfg.clear_otp_secret} />
+        <span class="toggle-text">
+          <strong>Clear saved TOTP secret</strong>
+        </span>
+      </label>
+    </div>
+  {/if}
+  <div class="form-row">
+    <label class="toggle-label">
+      <input type="checkbox" bind:checked={cfg.auto_reconnect} disabled={!otpSecretAvailable} />
+      <span class="toggle-text">
+        <strong>Auto reconnect with saved TOTP</strong>
+        <span class="toggle-hint">Available after a TOTP secret is saved.</span>
+      </span>
+    </label>
   </div>
   <div class="form-row">
     <label for="extra">Extra openconnect args (space separated)</label>
@@ -175,6 +220,7 @@
   .save-row { display: flex; justify-content: flex-end; }
 
   .trust-row { margin-top: 4px; }
+  .compact-toggle { margin-top: -4px; }
   .toggle-label {
     display: flex;
     align-items: flex-start;

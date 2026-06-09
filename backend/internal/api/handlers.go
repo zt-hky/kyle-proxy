@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"kyle-proxy/internal/auth"
@@ -60,41 +61,48 @@ func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 type configResponse struct {
-	Portal     string   `json:"portal"`
-	Gateway    string   `json:"gateway"`
-	Username   string   `json:"username"`
-	HasPass    bool     `json:"has_password"`
-	CertFile   string   `json:"cert_file"`
-	TrustCert  bool     `json:"trust_cert"`
-	ExtraArgs  []string `json:"extra_args"`
-	HTTPPort   int      `json:"http_port"`
-	Socks5Port int      `json:"socks5_port"`
-	VMessPort  int      `json:"vmess_port"`
-	ServerHost string   `json:"server_host"`
+	Portal        string   `json:"portal"`
+	Gateway       string   `json:"gateway"`
+	Username      string   `json:"username"`
+	HasPass       bool     `json:"has_password"`
+	HasOTPSecret  bool     `json:"has_otp_secret"`
+	AutoReconnect bool     `json:"auto_reconnect"`
+	CertFile      string   `json:"cert_file"`
+	TrustCert     bool     `json:"trust_cert"`
+	ExtraArgs     []string `json:"extra_args"`
+	HTTPPort      int      `json:"http_port"`
+	Socks5Port    int      `json:"socks5_port"`
+	VMessPort     int      `json:"vmess_port"`
+	ServerHost    string   `json:"server_host"`
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	cfg := h.cfgMgr.Get()
 	writeJSON(w, http.StatusOK, configResponse{
 		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
-		HasPass: cfg.VPN.Password != "", CertFile: cfg.VPN.CertFile, TrustCert: cfg.VPN.TrustCert,
+		HasPass: cfg.VPN.Password != "", HasOTPSecret: cfg.VPN.OTPSecret != "",
+		AutoReconnect: cfg.VPN.AutoReconnect && cfg.VPN.OTPSecret != "",
+		CertFile:      cfg.VPN.CertFile, TrustCert: cfg.VPN.TrustCert,
 		ExtraArgs: cfg.VPN.ExtraArgs, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
 		VMessPort: cfg.Proxy.VMessPort, ServerHost: cfg.Proxy.ServerHost,
 	})
 }
 
 type updateConfigRequest struct {
-	Portal     string   `json:"portal"`
-	Gateway    string   `json:"gateway"`
-	Username   string   `json:"username"`
-	Password   string   `json:"password"`
-	CertFile   string   `json:"cert_file"`
-	TrustCert  bool     `json:"trust_cert"`
-	ExtraArgs  []string `json:"extra_args"`
-	HTTPPort   int      `json:"http_port"`
-	Socks5Port int      `json:"socks5_port"`
-	VMessPort  int      `json:"vmess_port"`
-	ServerHost string   `json:"server_host"`
+	Portal         string   `json:"portal"`
+	Gateway        string   `json:"gateway"`
+	Username       string   `json:"username"`
+	Password       string   `json:"password"`
+	OTPSecret      string   `json:"otp_secret"`
+	ClearOTPSecret bool     `json:"clear_otp_secret"`
+	AutoReconnect  bool     `json:"auto_reconnect"`
+	CertFile       string   `json:"cert_file"`
+	TrustCert      bool     `json:"trust_cert"`
+	ExtraArgs      []string `json:"extra_args"`
+	HTTPPort       int      `json:"http_port"`
+	Socks5Port     int      `json:"socks5_port"`
+	VMessPort      int      `json:"vmess_port"`
+	ServerHost     string   `json:"server_host"`
 }
 
 func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -115,6 +123,16 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if req.Password != "" {
 		cfg.VPN.Password = req.Password
 	}
+	if req.ClearOTPSecret {
+		cfg.VPN.OTPSecret = ""
+	} else if secret := strings.TrimSpace(req.OTPSecret); secret != "" {
+		if err := vpn.ValidateTOTPSecret(secret); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid OTP secret: "+err.Error())
+			return
+		}
+		cfg.VPN.OTPSecret = secret
+	}
+	cfg.VPN.AutoReconnect = req.AutoReconnect && cfg.VPN.OTPSecret != ""
 	if req.HTTPPort > 0 {
 		cfg.Proxy.HTTPPort = req.HTTPPort
 	}
@@ -140,8 +158,9 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 type connectRequest struct {
-	OTP  string `json:"otp"`
-	OTP2 string `json:"otp2"`
+	OTP           string `json:"otp"`
+	OTP2          string `json:"otp2"`
+	AutoReconnect *bool  `json:"auto_reconnect"`
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -152,10 +171,20 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "VPN portal and username must be configured first")
 		return
 	}
+	autoReconnect := cfg.VPN.AutoReconnect
+	if req.AutoReconnect != nil {
+		autoReconnect = *req.AutoReconnect
+	}
+	if autoReconnect && cfg.VPN.OTPSecret == "" {
+		writeError(w, http.StatusBadRequest, "auto reconnect requires a saved OTP secret")
+		return
+	}
 	if err := h.vpnMgr.Connect(vpn.ConnectRequest{
 		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
-		Password: cfg.VPN.Password, OTP: req.OTP, OTP2: req.OTP2, CertFile: cfg.VPN.CertFile,
-		TrustCert: cfg.VPN.TrustCert,
+		Password: cfg.VPN.Password, OTP: req.OTP, OTP2: req.OTP2,
+		OTPSecret: cfg.VPN.OTPSecret, AutoReconnect: autoReconnect && cfg.VPN.OTPSecret != "",
+		CertFile:  cfg.VPN.CertFile,
+		TrustCert: cfg.VPN.TrustCert, ExtraArgs: cfg.VPN.ExtraArgs,
 	}); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return

@@ -18,20 +18,22 @@ type AppConfig struct {
 
 // VPNConfig stores GlobalProtect VPN settings
 type VPNConfig struct {
-	Portal    string   `json:"portal"`
-	Gateway   string   `json:"gateway,omitempty"`
-	Username  string   `json:"username"`
-	Password  string   `json:"password"`
-	CertFile  string   `json:"cert_file,omitempty"`  // custom CA cert path inside container
-	TrustCert bool     `json:"trust_cert"`           // skip TLS verification (--no-certificate-check)
-	ExtraArgs []string `json:"extra_args,omitempty"`
+	Portal        string   `json:"portal"`
+	Gateway       string   `json:"gateway,omitempty"`
+	Username      string   `json:"username"`
+	Password      string   `json:"password"`
+	OTPSecret     string   `json:"otp_secret,omitempty"`
+	AutoReconnect bool     `json:"auto_reconnect,omitempty"`
+	CertFile      string   `json:"cert_file,omitempty"` // custom CA cert path inside container
+	TrustCert     bool     `json:"trust_cert"`          // skip TLS verification (--no-certificate-check)
+	ExtraArgs     []string `json:"extra_args,omitempty"`
 }
 
 // ProxyConfig stores v2ray proxy settings
 type ProxyConfig struct {
 	HTTPPort   int    `json:"http_port"`
 	Socks5Port int    `json:"socks5_port"`
-	VMessPort  int    `json:"vmess_port"`   // VMess inbound port for v2box/v2ray clients
+	VMessPort  int    `json:"vmess_port"`            // VMess inbound port for v2box/v2ray clients
 	ServerHost string `json:"server_host,omitempty"` // public IP/hostname used in vmess:// links
 }
 

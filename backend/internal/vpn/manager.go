@@ -5,17 +5,21 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
+
+var sensitiveLogValueRE = regexp.MustCompile(`(?i)(password|passwd|otp|totp|secret|token|cookie|authcookie|portal-userauthcookie|prelogin-cookie|challenge|inputstr)(["'=:\s]+)([^&<>"'\s]+)`)
 
 // State represents VPN connection state
 type State string
@@ -30,48 +34,71 @@ const (
 
 // ConnectRequest holds runtime credentials (OTP is one-time, not stored)
 type ConnectRequest struct {
-	Portal    string `json:"portal"`
-	Gateway   string `json:"gateway"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	OTP       string `json:"otp"`
-	OTP2      string `json:"otp2"`
-	CertFile  string `json:"cert_file"`
-	TrustCert bool   `json:"trust_cert"` // fetch server cert and pass via --cafile (openconnect v9+)
+	Portal        string   `json:"portal"`
+	Gateway       string   `json:"gateway"`
+	Username      string   `json:"username"`
+	Password      string   `json:"password"`
+	OTP           string   `json:"otp"`
+	OTP2          string   `json:"otp2"`
+	OTPSecret     string   `json:"otp_secret"`
+	AutoReconnect bool     `json:"auto_reconnect"`
+	CertFile      string   `json:"cert_file"`
+	TrustCert     bool     `json:"trust_cert"` // fetch server cert and pass via --cafile (openconnect v9+)
+	ExtraArgs     []string `json:"extra_args,omitempty"`
 }
 
 // Status is returned by GetStatus()
 type Status struct {
-	State          State  `json:"state"`
-	IP             string `json:"ip,omitempty"`
-	Interface      string `json:"interface,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Since          string `json:"since,omitempty"`
-	AwaitingOTP    bool   `json:"awaiting_otp,omitempty"`
-	OTPPromptCount int    `json:"otp_prompt_count,omitempty"`
+	State            State  `json:"state"`
+	Phase            string `json:"phase,omitempty"`
+	Detail           string `json:"detail,omitempty"`
+	LastLog          string `json:"last_log,omitempty"`
+	IP               string `json:"ip,omitempty"`
+	Interface        string `json:"interface,omitempty"`
+	Error            string `json:"error,omitempty"`
+	Since            string `json:"since,omitempty"`
+	AwaitingOTP      bool   `json:"awaiting_otp,omitempty"`
+	OTPPromptCount   int    `json:"otp_prompt_count,omitempty"`
+	AutoOTP          bool   `json:"auto_otp,omitempty"`
+	AutoReconnect    bool   `json:"auto_reconnect,omitempty"`
+	ReconnectAttempt int    `json:"reconnect_attempt,omitempty"`
 }
 
 // Manager manages the VPN lifecycle using gpclient
 type Manager struct {
-	mu                sync.RWMutex
-	state             State
-	errorMsg          string
-	cmd               *exec.Cmd
-	stdin             io.WriteCloser
-	logs              []string
-	connectedAt       time.Time
-	tunInterface      string
-	awaitingOTP       bool
-	otpPromptCount    int
-	authResponsesSent int
-	onStateChange     func(State)
+	mu                  sync.RWMutex
+	state               State
+	errorMsg            string
+	cmd                 *exec.Cmd
+	stdin               io.WriteCloser
+	logs                []string
+	connectedAt         time.Time
+	tunInterface        string
+	phase               string
+	detail              string
+	lastLog             string
+	awaitingOTP         bool
+	otpPromptCount      int
+	authResponsesSent   int
+	credentialPrompts   int
+	savedPassword       string
+	otpSecret           string
+	lastAutoOTPStep     int64
+	autoOTPInFlight     bool
+	autoReconnect       bool
+	reconnectAttempt    int
+	gatewayPasswordSent bool
+	sawGatewayLogin     bool
+	sawParseError       bool
+	onStateChange       func(State)
 }
 
 // NewManager creates a new VPN manager
 func NewManager() *Manager {
 	return &Manager{
-		state: StateDisconnected,
-		logs:  make([]string, 0, 500),
+		state:           StateDisconnected,
+		logs:            make([]string, 0, 500),
+		lastAutoOTPStep: -1,
 	}
 }
 
@@ -88,11 +115,17 @@ func (m *Manager) GetStatus() Status {
 	defer m.mu.RUnlock()
 
 	s := Status{
-		State:          m.state,
-		Error:          m.errorMsg,
-		Interface:      m.tunInterface,
-		AwaitingOTP:    m.awaitingOTP,
-		OTPPromptCount: m.otpPromptCount,
+		State:            m.state,
+		Phase:            m.phase,
+		Detail:           m.detail,
+		LastLog:          m.lastLog,
+		Error:            m.errorMsg,
+		Interface:        m.tunInterface,
+		AwaitingOTP:      m.awaitingOTP,
+		OTPPromptCount:   m.otpPromptCount,
+		AutoOTP:          m.otpSecret != "",
+		AutoReconnect:    m.autoReconnect,
+		ReconnectAttempt: m.reconnectAttempt,
 	}
 
 	if m.state == StateConnected && !m.connectedAt.IsZero() {
@@ -115,6 +148,10 @@ func (m *Manager) GetLogs() []string {
 
 // Connect initiates a VPN connection asynchronously
 func (m *Manager) Connect(req ConnectRequest) error {
+	if req.AutoReconnect && strings.TrimSpace(req.OTPSecret) == "" {
+		return fmt.Errorf("auto reconnect requires a saved OTP secret")
+	}
+
 	m.mu.Lock()
 	if m.state == StateConnecting || m.state == StateConnected {
 		m.mu.Unlock()
@@ -123,10 +160,11 @@ func (m *Manager) Connect(req ConnectRequest) error {
 	m.mu.Unlock()
 
 	m.setState(StateConnecting, "")
+	m.setPhase("starting", "Starting VPN connection")
 	m.addLog("=== Starting VPN connection ===")
 
 	go func() {
-		if err := m.runGPClient(req); err != nil {
+		if err := m.runConnectLoop(req); err != nil {
 			m.addLog(fmt.Sprintf("ERROR: %v", err))
 			m.setState(StateError, err.Error())
 		}
@@ -147,12 +185,22 @@ func (m *Manager) SubmitOTP(otp string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("VPN is not awaiting authentication input")
 	}
+	if !m.awaitingOTP {
+		detail := m.detail
+		if detail == "" {
+			detail = string(m.state)
+		}
+		m.mu.Unlock()
+		return fmt.Errorf("VPN is not waiting for OTP (current step: %s)", detail)
+	}
 	stdin := m.stdin
 	if stdin == nil {
 		m.mu.Unlock()
 		return fmt.Errorf("VPN authentication input is not available")
 	}
 	m.awaitingOTP = false
+	m.phase = "auth"
+	m.detail = "Submitted OTP; waiting for VPN server"
 	m.mu.Unlock()
 
 	for _, token := range tokens {
@@ -215,9 +263,20 @@ func (m *Manager) Disconnect() error {
 	m.cmd = nil
 	m.stdin = nil
 	m.tunInterface = ""
+	m.phase = ""
+	m.detail = ""
 	m.awaitingOTP = false
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
+	m.credentialPrompts = 0
+	m.savedPassword = ""
+	m.otpSecret = ""
+	m.autoOTPInFlight = false
+	m.autoReconnect = false
+	m.reconnectAttempt = 0
+	m.gatewayPasswordSent = false
+	m.sawGatewayLogin = false
+	m.sawParseError = false
 	m.mu.Unlock()
 
 	m.setState(StateDisconnected, "")
@@ -236,8 +295,139 @@ func (m *Manager) Disconnect() error {
 //  2. POST to /ssl-vpn/login.esp     (submit credentials → receive cookie)
 //  3. POST to /ssl-vpn/getconfig.esp (fetch gateway list)
 //  4. Connect to chosen gateway via DTLS/TLS
+func (m *Manager) runConnectLoop(req ConnectRequest) error {
+	req.OTPSecret = strings.TrimSpace(req.OTPSecret)
+	req.AutoReconnect = req.AutoReconnect && req.OTPSecret != ""
+
+	attempt := 0
+	for {
+		m.mu.Lock()
+		m.otpSecret = req.OTPSecret
+		m.autoReconnect = req.AutoReconnect
+		m.reconnectAttempt = attempt
+		m.mu.Unlock()
+
+		err := m.runGPClient(req)
+		if err == nil {
+			return nil
+		}
+		if !req.AutoReconnect || !isReconnectableError(err) {
+			return err
+		}
+		if m.isStopped() {
+			return nil
+		}
+
+		attempt++
+		delay := reconnectDelay(attempt)
+		m.mu.Lock()
+		m.otpSecret = req.OTPSecret
+		m.autoReconnect = req.AutoReconnect
+		m.reconnectAttempt = attempt
+		m.mu.Unlock()
+		m.addLog(fmt.Sprintf("Auto reconnect: VPN stopped after being connected; retrying in %s (attempt %d)", delay.Round(time.Second), attempt))
+		m.setState(StateConnecting, "")
+		m.setPhase("reconnect-wait", fmt.Sprintf("VPN stopped; reconnecting in %s", delay.Round(time.Second)))
+		if !m.waitBeforeReconnect(delay) {
+			return nil
+		}
+	}
+}
+
+func (m *Manager) submitGeneratedOTP(promptCount int, secret string, stdin io.WriteCloser, afterStep int64) {
+	code, wait, err := generateNextTOTP(secret, afterStep, time.Now())
+	if err != nil {
+		m.failGeneratedOTP(promptCount, stdin, err)
+		return
+	}
+
+	if wait > 0 {
+		m.addLog(fmt.Sprintf("MFA: waiting %s for next OTP window before response #%d", wait.Round(time.Second), promptCount))
+		m.setPhase("mfa-auto-wait", fmt.Sprintf("Waiting for next OTP window before response #%d", promptCount))
+		if !m.waitForActiveAuth(wait, stdin) {
+			return
+		}
+	}
+
+	m.mu.RLock()
+	active := m.state == StateConnecting && m.stdin == stdin
+	m.mu.RUnlock()
+	if !active {
+		return
+	}
+
+	if _, err := fmt.Fprintf(stdin, "%s\n", code.Value); err != nil {
+		m.failGeneratedOTP(promptCount, stdin, fmt.Errorf("send generated OTP: %w", err))
+		return
+	}
+
+	m.mu.Lock()
+	if m.stdin == stdin {
+		m.lastAutoOTPStep = code.Step
+		m.autoOTPInFlight = false
+		m.authResponsesSent++
+		if m.authResponsesSent >= m.otpPromptCount {
+			m.awaitingOTP = false
+		}
+		m.phase = "mfa-auto"
+		m.detail = fmt.Sprintf("Submitted generated OTP response #%d; waiting for server", promptCount)
+	}
+	m.mu.Unlock()
+	m.addLog(fmt.Sprintf("MFA: submitted generated OTP response #%d", promptCount))
+}
+
+func (m *Manager) failGeneratedOTP(promptCount int, stdin io.WriteCloser, err error) {
+	m.mu.Lock()
+	if m.stdin == stdin && m.state == StateConnecting {
+		m.autoOTPInFlight = false
+		m.awaitingOTP = true
+		m.phase = "mfa"
+		m.detail = fmt.Sprintf("Automatic OTP failed; enter OTP response #%d manually", promptCount)
+	}
+	m.mu.Unlock()
+	m.addLog(fmt.Sprintf("MFA: automatic OTP failed: %v", err))
+}
+
+func (m *Manager) waitForActiveAuth(delay time.Duration, stdin io.WriteCloser) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return true
+		case <-ticker.C:
+			m.mu.RLock()
+			active := m.state == StateConnecting && m.stdin == stdin
+			m.mu.RUnlock()
+			if !active {
+				return false
+			}
+		}
+	}
+}
+
 func (m *Manager) runGPClient(req ConnectRequest) error {
 	m.addLog(fmt.Sprintf("Connecting to portal: %s (user: %s)", req.Portal, req.Username))
+	if err := m.runOpenConnect(req, false); err != nil {
+		if m.shouldRetryGatewayDirect() {
+			m.addLog("Auth: gateway response could not be parsed; retrying direct gateway mode")
+			m.setPhase("gateway-direct", "Retrying direct gateway login; wait for a fresh OTP prompt")
+			retryReq := req
+			retryReq.OTP = ""
+			retryReq.OTP2 = ""
+			return m.runOpenConnect(retryReq, true)
+		}
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
+	m.setPhase("preparing", "Preparing openconnect command")
 
 	// Build openconnect argument list
 	// --protocol=gp         → GlobalProtect protocol
@@ -260,6 +450,7 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 	// --servercert pin-sha256:<base64> is the correct replacement — it tells
 	// openconnect to accept exactly this cert regardless of hostname or CA chain.
 	if req.TrustCert {
+		m.setPhase("tls-pin", "Fetching VPN server certificate fingerprint")
 		m.addLog("⚠️  TrustCert: fetching server certificate fingerprint...")
 		pin, err := fetchServerCertPin(req.Portal)
 		if err != nil {
@@ -277,11 +468,15 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 
 	// Explicit gateway takes priority over portal for the tunnel endpoint
 	server := req.Portal
-	if req.Gateway != "" {
+	if directGateway {
+		args = append(args, "--usergroup=gateway")
+		m.addLog("Auth: using openconnect gateway-direct mode (--usergroup=gateway)")
+	} else if req.Gateway != "" {
 		// openconnect connects to the portal first to get config, then gateway.
 		// Providing --authgroup selects the gateway if the portal offers multiple.
 		args = append(args, "--authgroup="+req.Gateway)
 	}
+	args = append(args, req.ExtraArgs...)
 	args = append(args, server)
 
 	cmd := exec.Command("openconnect", args...)
@@ -308,8 +503,24 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 	m.awaitingOTP = false
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
+	m.credentialPrompts = 0
+	m.savedPassword = req.Password
+	m.otpSecret = strings.TrimSpace(req.OTPSecret)
+	m.autoReconnect = req.AutoReconnect && m.otpSecret != ""
+	m.autoOTPInFlight = false
+	m.gatewayPasswordSent = false
+	m.sawGatewayLogin = false
+	m.sawParseError = false
 	m.mu.Unlock()
 
+	switch {
+	case m.otpSecret != "":
+		m.setPhase("auth", "Submitting saved password; OTP will be generated when requested")
+	case len(inputLines) > 1:
+		m.setPhase("auth", "Submitting saved password and initial OTP")
+	default:
+		m.setPhase("auth", "Submitting saved password")
+	}
 	if err := m.writeInitialAuth(stdinPipe, inputLines); err != nil {
 		_ = stdinPipe.Close()
 		m.clearProcessAuthState()
@@ -339,10 +550,21 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 			return nil
 		}
 		m.clearProcessAuthState()
+		if currentState == StateConnected {
+			m.setState(StateDisconnected, "")
+			return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established: %w", err)}
+		}
 		return fmt.Errorf("gpclient exited: %w", err)
 	}
 
+	m.mu.RLock()
+	currentState := m.state
+	m.mu.RUnlock()
 	m.clearProcessAuthState()
+	if currentState == StateConnected {
+		m.setState(StateDisconnected, "")
+		return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established")}
+	}
 	m.setState(StateDisconnected, "")
 	return nil
 }
@@ -351,24 +573,34 @@ func (m *Manager) runGPClient(req ConnectRequest) error {
 func (m *Manager) streamOutput(r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		line := scanner.Text()
+		line := sanitizeLogLine(scanner.Text())
 		m.addLog(line)
-		log.Printf("[VPN] %s", line)
 
 		lower := strings.ToLower(line)
+		m.updatePhaseFromLine(lower)
+		if isCredentialPromptLine(lower) {
+			m.noteCredentialPrompt()
+		}
 		if isOTPPromptLine(lower) {
 			m.noteOTPPrompt()
 		}
 		switch {
-		case containsAny(lower, "connected", "tunnel is up", "established", "vpn connection established"):
+		case isVPNEstablishedLine(lower):
 			iface := detectTunInterface()
 			m.mu.Lock()
 			m.state = StateConnected
 			m.connectedAt = time.Now()
 			m.tunInterface = iface
+			m.awaitingOTP = false
+			m.phase = "connected"
+			m.detail = "VPN tunnel established"
 			cb := m.onStateChange
 			m.mu.Unlock()
-			m.addLog(fmt.Sprintf("Tunnel up on interface: %s", iface))
+			if iface != "" {
+				m.addLog(fmt.Sprintf("Tunnel up on interface: %s", iface))
+			} else {
+				m.addLog("Tunnel established; interface not detected yet")
+			}
 			if cb != nil {
 				cb(StateConnected)
 			}
@@ -402,6 +634,104 @@ func (m *Manager) writeInitialAuth(stdin io.Writer, lines []string) error {
 	return nil
 }
 
+func (m *Manager) updatePhaseFromLine(lower string) {
+	switch {
+	case strings.Contains(lower, "/global-protect/prelogin"):
+		m.setPhase("portal-prelogin", "Contacting GlobalProtect portal")
+	case strings.Contains(lower, "/global-protect/getconfig"):
+		m.setPhase("portal-config", "Fetching portal configuration")
+	case strings.Contains(lower, "please select globalprotect gateway"):
+		m.setPhase("gateway-select", "Selecting GlobalProtect gateway")
+	case strings.Contains(lower, "/ssl-vpn/prelogin"):
+		m.setPhase("gateway-prelogin", "Contacting selected gateway")
+	case strings.Contains(lower, "/ssl-vpn/login"):
+		m.markGatewayLoginAttempt()
+	case isPasswordPromptLine(lower):
+		m.setPhase("gateway-password", "Gateway password prompt is active")
+	case strings.Contains(lower, "failed to parse server response"):
+		m.markParseError()
+	case containsAny(lower, "unexpected 512 result from server", "status code 512"):
+		m.setPhase("auth-challenge", "Server returned another authentication challenge")
+	case strings.Contains(lower, "ssl negotiation"):
+		m.setPhase("tls-handshake", "Negotiating TLS with gateway")
+	case strings.Contains(lower, "connected to https"):
+		m.setPhase("tls-connected", "TLS connected; VPN tunnel is not established yet")
+	case strings.Contains(lower, "server certificate verify failed"):
+		m.setPhase("tls-warning", "Server certificate is pinned; continuing TLS handshake")
+	case strings.Contains(lower, "failed to complete authentication"):
+		m.setPhase("auth-failed", "Authentication failed")
+	case strings.Contains(lower, "user input required in non-interactive mode"):
+		m.setPhase("input-required", "VPN client needs another authentication response")
+	}
+}
+
+func (m *Manager) markGatewayLoginAttempt() {
+	m.mu.Lock()
+	m.sawGatewayLogin = true
+	m.phase = "gateway-login"
+	m.detail = "Submitting authentication to gateway"
+	m.mu.Unlock()
+}
+
+func (m *Manager) markParseError() {
+	m.mu.Lock()
+	m.sawParseError = true
+	m.phase = "auth-parse-error"
+	m.detail = "Gateway returned an authentication response openconnect could not parse"
+	m.awaitingOTP = false
+	m.mu.Unlock()
+}
+
+func (m *Manager) shouldRetryGatewayDirect() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.sawGatewayLogin && m.sawParseError
+}
+
+func (m *Manager) noteCredentialPrompt() {
+	m.mu.Lock()
+	m.credentialPrompts++
+	count := m.credentialPrompts
+	if count == 1 {
+		m.phase = "portal-auth"
+		m.detail = "Submitting portal credentials"
+		m.mu.Unlock()
+		return
+	}
+
+	stdin := m.stdin
+	password := m.savedPassword
+	shouldSendGatewayPassword := !m.gatewayPasswordSent && password != "" && stdin != nil
+	if shouldSendGatewayPassword {
+		m.gatewayPasswordSent = true
+		m.awaitingOTP = false
+		m.phase = "gateway-auth"
+		m.detail = "Gateway requested password; submitting saved password"
+	} else {
+		m.awaitingOTP = false
+		m.phase = "gateway-auth"
+		switch {
+		case password == "":
+			m.detail = "Gateway requested credentials, but no saved password is configured"
+		case m.gatewayPasswordSent:
+			m.detail = "Gateway requested credentials again; waiting for an explicit OTP/password prompt"
+		default:
+			m.detail = "Gateway requested credentials; waiting for an explicit prompt"
+		}
+	}
+	m.mu.Unlock()
+
+	if shouldSendGatewayPassword {
+		if _, err := fmt.Fprintf(stdin, "%s\n", password); err != nil {
+			m.addLog(fmt.Sprintf("Auth: failed to submit saved gateway password: %v", err))
+			return
+		}
+		m.addLog("Auth: gateway requested password; submitted saved password (not OTP)")
+		return
+	}
+	m.addLog("Auth: gateway credential prompt detected; not treating it as OTP")
+}
+
 func (m *Manager) recordAuthResponse() {
 	m.mu.Lock()
 	m.authResponsesSent++
@@ -412,15 +742,55 @@ func (m *Manager) recordAuthResponse() {
 }
 
 func (m *Manager) noteOTPPrompt() {
+	var (
+		autoSecret  string
+		stdin       io.WriteCloser
+		promptCount int
+		afterStep   int64
+		needsInput  bool
+	)
+
 	m.mu.Lock()
+	if m.awaitingOTP || m.autoOTPInFlight {
+		m.phase = "mfa"
+		if m.autoOTPInFlight {
+			m.detail = fmt.Sprintf("Generating OTP response #%d", m.otpPromptCount)
+		} else {
+			m.detail = fmt.Sprintf("Waiting for fresh OTP response #%d", m.otpPromptCount)
+		}
+		m.mu.Unlock()
+		return
+	}
 	m.otpPromptCount++
-	needsInput := m.authResponsesSent < m.otpPromptCount
+	promptCount = m.otpPromptCount
+	needsInput = m.authResponsesSent < promptCount
 	if needsInput {
-		m.awaitingOTP = true
+		autoSecret = strings.TrimSpace(m.otpSecret)
+		stdin = m.stdin
+		afterStep = m.lastAutoOTPStep
+		if autoSecret != "" && stdin != nil {
+			m.awaitingOTP = false
+			m.autoOTPInFlight = true
+			m.phase = "mfa-auto"
+			m.detail = fmt.Sprintf("Generating OTP response #%d", promptCount)
+		} else {
+			m.awaitingOTP = true
+			m.phase = "mfa"
+			m.detail = fmt.Sprintf("Waiting for fresh OTP response #%d", promptCount)
+		}
+	} else {
+		m.phase = "mfa"
+		m.detail = fmt.Sprintf("Submitted OTP response #%d; waiting for server", promptCount)
 	}
 	m.mu.Unlock()
+
 	if needsInput {
-		m.addLog(fmt.Sprintf("MFA: waiting for fresh OTP response #%d", m.otpPromptCount))
+		if autoSecret != "" && stdin != nil {
+			m.addLog(fmt.Sprintf("MFA: generating OTP response #%d from saved TOTP secret", promptCount))
+			go m.submitGeneratedOTP(promptCount, autoSecret, stdin, afterStep)
+			return
+		}
+		m.addLog(fmt.Sprintf("MFA: waiting for fresh OTP response #%d", promptCount))
 	}
 }
 
@@ -431,6 +801,19 @@ func (m *Manager) clearProcessAuthState() {
 	m.awaitingOTP = false
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
+	m.credentialPrompts = 0
+	m.savedPassword = ""
+	m.otpSecret = ""
+	m.autoOTPInFlight = false
+	m.autoReconnect = false
+	m.gatewayPasswordSent = false
+	m.mu.Unlock()
+}
+
+func (m *Manager) setPhase(phase, detail string) {
+	m.mu.Lock()
+	m.phase = phase
+	m.detail = detail
 	m.mu.Unlock()
 }
 
@@ -439,6 +822,16 @@ func (m *Manager) setState(s State, errMsg string) {
 	m.mu.Lock()
 	m.state = s
 	m.errorMsg = errMsg
+	if s == StateDisconnected {
+		m.phase = ""
+		m.detail = ""
+		m.awaitingOTP = false
+	}
+	if s == StateError && errMsg != "" {
+		m.phase = "error"
+		m.detail = errMsg
+		m.awaitingOTP = false
+	}
 	cb := m.onStateChange
 	m.mu.Unlock()
 	if cb != nil {
@@ -448,16 +841,28 @@ func (m *Manager) setState(s State, errMsg string) {
 
 // addLog appends a timestamped log line (capped at 500 lines)
 func (m *Manager) addLog(line string) {
+	line = sanitizeLogLine(line)
 	ts := time.Now().Format("15:04:05")
 	entry := fmt.Sprintf("[%s] %s", ts, line)
 	log.Printf("[VPN] %s", line)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.lastLog = line
 	m.logs = append(m.logs, entry)
 	if len(m.logs) > 500 {
 		m.logs = m.logs[len(m.logs)-500:]
 	}
+}
+
+func sanitizeLogLine(line string) string {
+	lower := strings.ToLower(line)
+	for _, header := range []string{"cookie:", "set-cookie:", "authorization:"} {
+		if idx := strings.Index(lower, header); idx >= 0 {
+			return line[:idx+len(header)] + " [redacted]"
+		}
+	}
+	return sensitiveLogValueRE.ReplaceAllString(line, "$1$2[redacted]")
 }
 
 // detectTunInterface finds the tun/gpd interface created by gpclient
@@ -466,13 +871,26 @@ func detectTunInterface() string {
 		ifaces, _ := net.Interfaces()
 		for _, iface := range ifaces {
 			n := iface.Name
-			if strings.HasPrefix(n, "tun") || strings.HasPrefix(n, "gpd-") || strings.HasPrefix(n, "utun") {
+			if isVPNInterfaceName(n) {
 				return n
 			}
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return "tun0" // default fallback
+	return ""
+}
+
+func isVPNInterfaceName(name string) bool {
+	if strings.HasPrefix(name, "gpd-") || strings.HasPrefix(name, "utun") {
+		return true
+	}
+	if strings.HasPrefix(name, "tun") {
+		if len(name) == 3 {
+			return true
+		}
+		return name[3] >= '0' && name[3] <= '9'
+	}
+	return false
 }
 
 // getInterfaceIP returns the first IPv4 address of the given interface
@@ -506,6 +924,59 @@ func containsAny(s string, substrs ...string) bool {
 	return false
 }
 
+type reconnectableVPNError struct {
+	err error
+}
+
+func (e reconnectableVPNError) Error() string {
+	return e.err.Error()
+}
+
+func (e reconnectableVPNError) Unwrap() error {
+	return e.err
+}
+
+func isReconnectableError(err error) bool {
+	var target reconnectableVPNError
+	return errors.As(err, &target)
+}
+
+func reconnectDelay(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 5 * time.Second
+	}
+	delay := time.Duration(attempt*5) * time.Second
+	if delay > time.Minute {
+		return time.Minute
+	}
+	return delay
+}
+
+func (m *Manager) waitBeforeReconnect(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			return !m.isStopped()
+		case <-ticker.C:
+			if m.isStopped() {
+				return false
+			}
+		}
+	}
+}
+
+func (m *Manager) isStopped() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.state == StateDisconnecting || m.state == StateDisconnected
+}
+
 func authInputLines(req ConnectRequest) []string {
 	lines := []string{req.Password}
 	return append(lines, otpInputs(req.OTP, req.OTP2)...)
@@ -524,6 +995,25 @@ func otpInputs(values ...string) []string {
 func isOTPPromptLine(lower string) bool {
 	return strings.Contains(lower, "otp") &&
 		(strings.Contains(lower, "enter") || strings.Contains(lower, "please") || strings.Contains(lower, "value"))
+}
+
+func isCredentialPromptLine(lower string) bool {
+	return strings.Contains(lower, "enter login credentials")
+}
+
+func isPasswordPromptLine(lower string) bool {
+	return strings.HasPrefix(strings.TrimSpace(lower), "password:")
+}
+
+func isVPNEstablishedLine(lower string) bool {
+	return containsAny(lower,
+		"vpn connection established",
+		"esp session established",
+		"cstp connected",
+		"connected as ",
+		"configured as ",
+		"tunnel is up",
+	)
 }
 
 func splitOTPValues(value string) []string {
