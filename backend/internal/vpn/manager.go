@@ -87,6 +87,7 @@ type Manager struct {
 	autoOTPInFlight     bool
 	autoReconnect       bool
 	reconnectAttempt    int
+	stopRequested       bool
 	gatewayPasswordSent bool
 	sawGatewayLogin     bool
 	sawParseError       bool
@@ -157,6 +158,7 @@ func (m *Manager) Connect(req ConnectRequest) error {
 		m.mu.Unlock()
 		return fmt.Errorf("VPN already %s", m.state)
 	}
+	m.stopRequested = false
 	m.mu.Unlock()
 
 	m.setState(StateConnecting, "")
@@ -216,6 +218,7 @@ func (m *Manager) SubmitOTP(otp string) error {
 // Disconnect terminates the VPN connection gracefully
 func (m *Manager) Disconnect() error {
 	m.mu.Lock()
+	m.stopRequested = true
 	cmd := m.cmd
 	state := m.state
 	m.mu.Unlock()
@@ -307,6 +310,9 @@ func (m *Manager) runConnectLoop(req ConnectRequest) error {
 		m.reconnectAttempt = attempt
 		m.mu.Unlock()
 
+		if attempt > 0 {
+			m.addLog(fmt.Sprintf("Auto reconnect: starting attempt %d", attempt))
+		}
 		err := m.runGPClient(req)
 		if err == nil {
 			return nil
@@ -315,6 +321,7 @@ func (m *Manager) runConnectLoop(req ConnectRequest) error {
 			return err
 		}
 		if m.isStopped() {
+			m.addLog("Auto reconnect: cancelled by disconnect request")
 			return nil
 		}
 
@@ -496,6 +503,12 @@ func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("openconnect start failed: %w", err)
 	}
+	processStartedAt := time.Now()
+	mode := "portal"
+	if directGateway {
+		mode = "gateway-direct"
+	}
+	m.addLog(fmt.Sprintf("Trace: openconnect started (pid=%d, mode=%s)", cmd.Process.Pid, mode))
 
 	m.mu.Lock()
 	m.cmd = cmd
@@ -540,33 +553,33 @@ func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
 	}()
 	wg.Wait()
 
-	if err := cmd.Wait(); err != nil {
-		// Check if disconnection was intentional
-		m.mu.RLock()
-		currentState := m.state
-		m.mu.RUnlock()
-		if currentState == StateDisconnecting || currentState == StateDisconnected {
-			m.clearProcessAuthState()
-			return nil
-		}
-		m.clearProcessAuthState()
-		if currentState == StateConnected {
-			m.setState(StateDisconnected, "")
-			return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established: %w", err)}
-		}
-		return fmt.Errorf("gpclient exited: %w", err)
-	}
-
+	waitErr := cmd.Wait()
 	m.mu.RLock()
 	currentState := m.state
+	tunnelEstablished := m.connectedAt.After(processStartedAt)
+	stopRequested := m.stopRequested
 	m.mu.RUnlock()
-	m.clearProcessAuthState()
-	if currentState == StateConnected {
-		m.setState(StateDisconnected, "")
-		return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established")}
+	processResult := "exit-code-0"
+	if waitErr != nil {
+		processResult = waitErr.Error()
 	}
-	m.setState(StateDisconnected, "")
-	return nil
+	m.addLog(fmt.Sprintf(
+		"Trace: openconnect exited (pid=%d, runtime=%s, state=%s, tunnel_established=%t, stop_requested=%t, result=%s)",
+		cmd.Process.Pid,
+		time.Since(processStartedAt).Round(time.Millisecond),
+		currentState,
+		tunnelEstablished,
+		stopRequested,
+		processResult,
+	))
+	m.clearProcessAuthState()
+	exitErr := classifyOpenConnectExit(waitErr, currentState, tunnelEstablished, stopRequested)
+	if isReconnectableError(exitErr) {
+		m.setState(StateDisconnected, "")
+	} else if exitErr == nil && !stopRequested && currentState != StateDisconnecting {
+		m.setState(StateDisconnected, "")
+	}
+	return exitErr
 }
 
 // streamOutput reads process output line by line, logs it, and detects state transitions
@@ -594,8 +607,12 @@ func (m *Manager) streamOutput(r io.Reader) {
 			m.awaitingOTP = false
 			m.phase = "connected"
 			m.detail = "VPN tunnel established"
+			reconnectAttempt := m.reconnectAttempt
 			cb := m.onStateChange
 			m.mu.Unlock()
+			if reconnectAttempt > 0 {
+				m.addLog(fmt.Sprintf("Auto reconnect: attempt %d established the VPN tunnel", reconnectAttempt))
+			}
 			if iface != "" {
 				m.addLog(fmt.Sprintf("Tunnel up on interface: %s", iface))
 			} else {
@@ -941,6 +958,22 @@ func isReconnectableError(err error) bool {
 	return errors.As(err, &target)
 }
 
+func classifyOpenConnectExit(waitErr error, currentState State, tunnelEstablished, stopRequested bool) error {
+	if stopRequested || currentState == StateDisconnecting {
+		return nil
+	}
+	if tunnelEstablished {
+		if waitErr != nil {
+			return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established: %w", waitErr)}
+		}
+		return reconnectableVPNError{err: fmt.Errorf("openconnect exited after tunnel was established")}
+	}
+	if waitErr != nil {
+		return fmt.Errorf("openconnect exited before tunnel was established: %w", waitErr)
+	}
+	return nil
+}
+
 func reconnectDelay(attempt int) time.Duration {
 	if attempt <= 1 {
 		return 5 * time.Second
@@ -974,7 +1007,7 @@ func (m *Manager) waitBeforeReconnect(delay time.Duration) bool {
 func (m *Manager) isStopped() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.state == StateDisconnecting || m.state == StateDisconnected
+	return m.stopRequested
 }
 
 func authInputLines(req ConnectRequest) []string {

@@ -2,6 +2,7 @@ package vpn
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -148,6 +149,42 @@ func TestSubmitOTPRequiresOTPPrompt(t *testing.T) {
 	}
 	if got := stdin.String(); got != "123456\n" {
 		t.Fatalf("SubmitOTP write = %q, want OTP line", got)
+	}
+}
+
+func TestObservedDisconnectDoesNotCancelAutoReconnect(t *testing.T) {
+	m := NewManager()
+	m.mu.Lock()
+	m.state = StateDisconnected
+	m.mu.Unlock()
+
+	if m.isStopped() {
+		t.Fatal("observed disconnected state was treated as an intentional stop")
+	}
+
+	m.mu.Lock()
+	m.stopRequested = true
+	m.mu.Unlock()
+	if !m.isStopped() {
+		t.Fatal("explicit disconnect request did not stop reconnect")
+	}
+}
+
+func TestEstablishedTunnelExitIsReconnectableAfterDisconnectedLine(t *testing.T) {
+	processErr := errors.New("exit status 1")
+	err := classifyOpenConnectExit(processErr, StateDisconnected, true, false)
+	if !isReconnectableError(err) {
+		t.Fatalf("established tunnel exit was not reconnectable: %v", err)
+	}
+	if !errors.Is(err, processErr) {
+		t.Fatalf("reconnectable exit did not wrap process result: %v", err)
+	}
+}
+
+func TestRequestedDisconnectIsNotReconnectable(t *testing.T) {
+	err := classifyOpenConnectExit(errors.New("signal: terminated"), StateDisconnecting, true, true)
+	if err != nil {
+		t.Fatalf("requested disconnect returned an error: %v", err)
 	}
 }
 
