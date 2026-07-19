@@ -50,6 +50,7 @@ func NewAccessStore(path string, ownerID int64) (*AccessStore, error) {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, fmt.Errorf("decode access store: %w", err)
 	}
+	now := time.Now()
 	for _, rec := range file.Users {
 		if rec.UserID <= 0 || rec.ChatID <= 0 || rec.ChatID != rec.UserID || rec.UserID == ownerID {
 			return nil, fmt.Errorf("invalid access record")
@@ -57,11 +58,18 @@ func NewAccessStore(path string, ownerID int64) (*AccessStore, error) {
 		if rec.Status != AccessPending && rec.Status != AccessApproved && rec.Status != AccessDenied {
 			return nil, fmt.Errorf("invalid access status")
 		}
-		if rec.RequestedAt.IsZero() || rec.RequestedAt.After(time.Now().Add(time.Minute)) {
+		if rec.RequestedAt.IsZero() || rec.RequestedAt.After(now.Add(time.Minute)) {
 			return nil, fmt.Errorf("invalid access timestamp")
 		}
-		if rec.Status == AccessPending && rec.DecidedAt != nil || rec.Status != AccessPending && rec.DecidedAt == nil {
-			return nil, fmt.Errorf("invalid decision timestamp")
+		switch rec.Status {
+		case AccessPending:
+			if rec.DecidedAt != nil {
+				return nil, fmt.Errorf("invalid decision timestamp")
+			}
+		default:
+			if rec.DecidedAt == nil || rec.DecidedAt.IsZero() || rec.DecidedAt.Before(rec.RequestedAt) || rec.DecidedAt.After(now.Add(time.Minute)) {
+				return nil, fmt.Errorf("invalid decision timestamp")
+			}
 		}
 		if _, exists := s.users[rec.UserID]; exists {
 			return nil, fmt.Errorf("duplicate access user")

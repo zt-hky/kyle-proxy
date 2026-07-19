@@ -16,11 +16,30 @@ import (
 	"globalprotect-manager/internal/vpn"
 )
 
+type telegramClient interface {
+	DeleteWebhook(context.Context, *bot.DeleteWebhookParams) (bool, error)
+	SetMyCommands(context.Context, *bot.SetMyCommandsParams) (bool, error)
+	SendMessage(context.Context, *bot.SendMessageParams) (*models.Message, error)
+	DeleteMessage(context.Context, *bot.DeleteMessageParams) (bool, error)
+	AnswerCallbackQuery(context.Context, *bot.AnswerCallbackQueryParams) (bool, error)
+	Start(context.Context)
+}
+
+type vpnController interface {
+	Connect(control.ConnectOptions) error
+	SubmitOTP(string) error
+	Disconnect() error
+	Status() vpn.Status
+	OnEvent(func(vpn.Event))
+	HasSavedOTP() bool
+}
+
 type Service struct {
-	bot             *bot.Bot
+	bot             telegramClient
 	ownerID         int64
 	access          *AccessStore
-	controller      *control.VPN
+	controller      vpnController
+	now             func() time.Time
 	authorizationMu sync.Mutex
 	mu              sync.Mutex
 	stopping        bool
@@ -29,8 +48,10 @@ type Service struct {
 	eventCond       *sync.Cond
 	events          []vpn.Event
 	eventHead       int
+	eventInFlight   bool
 	eventStopping   bool
 }
+
 type pendingOTP struct {
 	ChatID          int64
 	PromptMessageID int
@@ -43,7 +64,7 @@ func New(token string, ownerID int64, accessPath string, controller *control.VPN
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{ownerID: ownerID, access: access, controller: controller, pending: make(map[int64]pendingOTP)}
+	s := newService(ownerID, access, controller, nil)
 	b, err := bot.New(token,
 		bot.WithMessageTextHandler("start", bot.MatchTypeCommand, s.start),
 		bot.WithMessageTextHandler("menu", bot.MatchTypeCommand, s.menu),
@@ -60,10 +81,23 @@ func New(token string, ownerID int64, accessPath string, controller *control.VPN
 		return nil, err
 	}
 	s.bot = b
-	s.eventCond = sync.NewCond(&s.eventMu)
-	controller.OnEvent(s.notify)
 	return s, nil
 }
+
+func newService(ownerID int64, access *AccessStore, controller vpnController, client telegramClient) *Service {
+	s := &Service{
+		bot:        client,
+		ownerID:    ownerID,
+		access:     access,
+		controller: controller,
+		now:        time.Now,
+		pending:    make(map[int64]pendingOTP),
+	}
+	s.eventCond = sync.NewCond(&s.eventMu)
+	controller.OnEvent(s.notify)
+	return s
+}
+
 func (s *Service) Start(ctx context.Context) {
 	if _, err := s.bot.DeleteWebhook(ctx, &bot.DeleteWebhookParams{DropPendingUpdates: false}); err != nil {
 		log.Printf("telegram webhook setup failed: %v", err)
@@ -75,7 +109,6 @@ func (s *Service) Start(ctx context.Context) {
 		return
 	}
 	go s.dispatchEvents(ctx)
-
 	s.bot.Start(ctx)
 }
 
@@ -86,13 +119,11 @@ func (s *Service) BeginShutdown() {
 }
 
 func (s *Service) Flush(ctx context.Context) error {
-	s.mu.Lock()
-	s.stopping = true
-	s.mu.Unlock()
+	s.BeginShutdown()
 	s.eventMu.Lock()
 	s.eventStopping = true
 	s.eventCond.Broadcast()
-	for s.eventHead < len(s.events) {
+	for s.eventHead < len(s.events) || s.eventInFlight {
 		if ctx.Err() != nil {
 			s.eventMu.Unlock()
 			return ctx.Err()
@@ -111,24 +142,39 @@ func (s *Service) Flush(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) allowed(update *models.Update) (int64, bool) {
-	var chatID, userID int64
+func (s *Service) isStopping() bool {
 	s.mu.Lock()
-	stopping := s.stopping
-	s.mu.Unlock()
-	if stopping {
+	defer s.mu.Unlock()
+	return s.stopping
+}
+
+func privateIdentity(update *models.Update) (chatID, userID int64, ok bool) {
+	if update == nil {
+		return 0, 0, false
+	}
+	if update.Message != nil && update.Message.From != nil {
+		chat := update.Message.Chat
+		if chat.Type == models.ChatTypePrivate && chat.ID == update.Message.From.ID {
+			return chat.ID, update.Message.From.ID, true
+		}
+	}
+	if update.CallbackQuery != nil && update.CallbackQuery.Message.Message != nil {
+		chat := update.CallbackQuery.Message.Message.Chat
+		if chat.Type == models.ChatTypePrivate && chat.ID == update.CallbackQuery.From.ID {
+			return chat.ID, update.CallbackQuery.From.ID, true
+		}
+	}
+	return 0, 0, false
+}
+
+// allowed must be called while authorizationMu is held for any operation that
+// mutates access or invokes the VPN controller.
+func (s *Service) allowed(update *models.Update) (int64, bool) {
+	if s.isStopping() {
 		return 0, false
 	}
-	if update.Message != nil {
-		chatID = update.Message.Chat.ID
-		userID = update.Message.From.ID
-	} else if update.CallbackQuery != nil && update.CallbackQuery.Message.Message != nil {
-		chatID = update.CallbackQuery.Message.Message.Chat.ID
-		userID = update.CallbackQuery.From.ID
-	} else {
-		return 0, false
-	}
-	if chatID != userID {
+	chatID, userID, ok := privateIdentity(update)
+	if !ok {
 		return 0, false
 	}
 	if userID == s.ownerID {
@@ -137,43 +183,67 @@ func (s *Service) allowed(update *models.Update) (int64, bool) {
 	r, ok := s.access.Get(userID)
 	return chatID, ok && r.Status == AccessApproved
 }
-func (s *Service) start(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if u.Message == nil || u.Message.Chat.ID != u.Message.From.ID {
+
+func (s *Service) start(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
+	if s.isStopping() {
 		return
 	}
-	id := u.Message.From.ID
+	chat, id, ok := privateIdentity(u)
+	if !ok {
+		return
+	}
 	if id == s.ownerID {
-		s.sendMenu(ctx, b, u.Message.Chat.ID)
+		s.sendMenu(ctx, chat)
 		return
 	}
-	if r, ok := s.access.Get(id); ok && r.Status == AccessApproved {
-		s.sendMenu(ctx, b, u.Message.Chat.ID)
+	if old, exists := s.access.Get(id); exists {
+		switch old.Status {
+		case AccessApproved:
+			s.sendMenu(ctx, chat)
+		case AccessPending:
+			s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request is pending owner approval."})
+		case AccessDenied:
+			s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request was denied."})
+		}
 		return
 	}
-	now := time.Now()
-	r := AccessRecord{UserID: id, ChatID: u.Message.Chat.ID, Username: u.Message.From.Username, DisplayName: displayName(u.Message.From), Status: AccessPending, RequestedAt: now}
-	if old, ok := s.access.Get(id); ok && old.Status == AccessPending {
-		return
-	}
+	now := s.now()
+	r := AccessRecord{UserID: id, ChatID: chat, Username: u.Message.From.Username, DisplayName: displayName(u.Message.From), Status: AccessPending, RequestedAt: now}
 	if err := s.access.Upsert(r); err != nil {
 		log.Printf("telegram access save failed: %v", err)
 		return
 	}
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: u.Message.Chat.ID, Text: "Access request is pending owner approval."})
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: s.ownerID, Text: fmt.Sprintf("Access request from %s (%d)", r.DisplayName, id), ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{Text: "Approve", CallbackData: "access:approve:" + fmt.Sprint(id)}, {Text: "Deny", CallbackData: "access:deny:" + fmt.Sprint(id)}}}}})
+	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request is pending owner approval."})
+	s.send(ctx, &bot.SendMessageParams{ChatID: s.ownerID, Text: fmt.Sprintf("Access request from %s (%d)", r.DisplayName, id), ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{Text: "Approve", CallbackData: "access:approve:" + fmt.Sprint(id)}, {Text: "Deny", CallbackData: "access:deny:" + fmt.Sprint(id)}}}}})
 }
-func (s *Service) menu(ctx context.Context, b *bot.Bot, u *models.Update) {
+
+func (s *Service) menu(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
 	if chat, ok := s.allowed(u); ok {
-		s.sendMenu(ctx, b, chat)
+		s.sendMenu(ctx, chat)
 	}
 }
-func (s *Service) status(ctx context.Context, b *bot.Bot, u *models.Update) {
+
+func (s *Service) status(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
 	if chat, ok := s.allowed(u); ok {
-		s.sendStatus(ctx, b, chat)
+		s.sendStatus(ctx, chat)
 	}
 }
-func (s *Service) accessCommand(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if u.Message == nil || u.Message.Chat.ID != u.Message.From.ID || u.Message.From.ID != s.ownerID {
+
+func (s *Service) accessCommand(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
+	chat, ok := s.allowed(u)
+	if !ok {
+		return
+	}
+	_, id, _ := privateIdentity(u)
+	if id != s.ownerID {
 		return
 	}
 	records := s.access.Snapshot()
@@ -184,61 +254,64 @@ func (s *Service) accessCommand(ctx context.Context, b *bot.Bot, u *models.Updat
 	if len(records) == 0 {
 		text += "(none)"
 	}
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: s.ownerID, Text: text})
-}
-func (s *Service) connect(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if chat, ok := s.allowed(u); ok {
-		s.authorizationMu.Lock()
-		defer s.authorizationMu.Unlock()
-		if !s.controller.HasSavedOTP() {
-			var id int64
-			if u.Message != nil {
-				id = u.Message.From.ID
-			} else {
-				id = u.CallbackQuery.From.ID
-			}
-			msg, err := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the initial GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
-			if err != nil {
-				return
-			}
-			s.mu.Lock()
-			s.pending[id] = pendingOTP{ChatID: chat, PromptMessageID: msg.ID, Kind: "initial", ExpiresAt: time.Now().Add(120 * time.Second)}
-			s.mu.Unlock()
-			return
-		}
-		if err := s.controller.Connect(control.ConnectOptions{}); err != nil {
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Connect failed: " + err.Error()})
-			return
-		}
-		s.sendStatus(ctx, b, chat)
-	}
+	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: text})
 }
 
-func (s *Service) text(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if u.Message == nil || u.Message.Chat.ID != u.Message.From.ID {
-		return
-	}
+func (s *Service) connect(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	s.authorizationMu.Lock()
 	defer s.authorizationMu.Unlock()
 	chat, ok := s.allowed(u)
 	if !ok {
 		return
 	}
-	s.mu.Lock()
-	prompt, exists := s.pending[u.Message.From.ID]
-	if exists {
-		delete(s.pending, u.Message.From.ID)
-	}
-	s.mu.Unlock()
-	if !exists || prompt.ChatID != chat || time.Now().After(prompt.ExpiresAt) {
+	_, userID, _ := privateIdentity(u)
+	s.connectLocked(ctx, chat, userID)
+}
+
+func (s *Service) connectLocked(ctx context.Context, chat, userID int64) {
+	if !s.controller.HasSavedOTP() {
+		msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the initial GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		s.pending[userID] = pendingOTP{ChatID: chat, PromptMessageID: msg.ID, Kind: "initial", ExpiresAt: s.now().Add(120 * time.Second)}
+		s.mu.Unlock()
 		return
 	}
-	if _, err := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chat, MessageID: prompt.PromptMessageID}); err != nil {
-		log.Printf("telegram prompt deletion failed message=%d: %v", prompt.PromptMessageID, err)
+	if err := s.controller.Connect(control.ConnectOptions{}); err != nil {
+		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Connect failed: " + err.Error()})
+		return
 	}
-	if _, err := b.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chat, MessageID: u.Message.ID}); err != nil {
-		log.Printf("telegram OTP deletion failed message=%d: %v", u.Message.ID, err)
+	s.sendStatus(ctx, chat)
+}
+
+func (s *Service) text(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
+	chat, ok := s.allowed(u)
+	if !ok || u.Message == nil {
+		return
 	}
+	_, userID, _ := privateIdentity(u)
+
+	s.mu.Lock()
+	prompt, exists := s.pending[userID]
+	matchesReply := exists && prompt.ChatID == chat && u.Message.ReplyToMessage != nil && u.Message.ReplyToMessage.ID == prompt.PromptMessageID
+	if matchesReply {
+		delete(s.pending, userID)
+	}
+	s.mu.Unlock()
+	if !matchesReply {
+		return
+	}
+
+	s.deleteMessage(ctx, chat, prompt.PromptMessageID, "prompt")
+	s.deleteMessage(ctx, chat, u.Message.ID, "OTP")
+	if !s.now().Before(prompt.ExpiresAt) {
+		return
+	}
+
 	var err error
 	if prompt.Kind == "followup" {
 		err = s.controller.SubmitOTP(u.Message.Text)
@@ -246,42 +319,69 @@ func (s *Service) text(ctx context.Context, b *bot.Bot, u *models.Update) {
 		err = s.controller.Connect(control.ConnectOptions{OTP: u.Message.Text})
 	}
 	if err != nil {
-		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "OTP failed: " + err.Error()})
+		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "OTP failed: " + err.Error()})
 		return
 	}
-	s.sendStatus(ctx, b, chat)
+	s.sendStatus(ctx, chat)
 }
-func (s *Service) accessCallback(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if u.CallbackQuery == nil {
+
+func (s *Service) deleteMessage(ctx context.Context, chat int64, messageID int, label string) {
+	if _, err := s.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chat, MessageID: messageID}); err != nil {
+		// Telegram errors do not need message contents to be actionable. Logging
+		// only the error type prevents an OTP echoed by an adapter from leaking.
+		log.Printf("telegram %s deletion failed message=%d error=%T", label, messageID, err)
+	}
+}
+
+func (s *Service) accessCallback(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	if u == nil || u.CallbackQuery == nil {
 		return
 	}
-	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: u.CallbackQuery.ID})
-	if u.CallbackQuery.From.ID != s.ownerID || u.CallbackQuery.Message.Message == nil || u.CallbackQuery.Message.Message.Chat.ID != s.ownerID {
-		return
-	}
+	s.answerCallback(ctx, u.CallbackQuery.ID)
 	s.authorizationMu.Lock()
 	defer s.authorizationMu.Unlock()
+	if _, ok := s.allowed(u); !ok || u.CallbackQuery.From.ID != s.ownerID {
+		return
+	}
 	parts := strings.Split(u.CallbackQuery.Data, ":")
 	if len(parts) != 3 {
 		return
 	}
 	id, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil {
+	if err != nil || id == s.ownerID {
 		return
 	}
 	rec, ok := s.access.Get(id)
 	if !ok {
 		return
 	}
-	now := time.Now()
+	now := s.now()
 	switch parts[1] {
 	case "approve":
+		if rec.Status != AccessPending && rec.Status != AccessDenied {
+			return
+		}
 		rec.Status, rec.DecidedAt = AccessApproved, &now
+		if err := s.access.Upsert(rec); err != nil {
+			log.Printf("telegram access decision failed: %v", err)
+			return
+		}
 	case "deny":
+		if rec.Status != AccessPending {
+			return
+		}
 		rec.Status, rec.DecidedAt = AccessDenied, &now
+		if err := s.access.Upsert(rec); err != nil {
+			log.Printf("telegram access decision failed: %v", err)
+			return
+		}
 	case "revoke":
+		if rec.Status != AccessApproved {
+			return
+		}
 		if err := s.access.Delete(id); err != nil {
 			log.Printf("telegram access revoke failed: %v", err)
+			return
 		}
 		s.mu.Lock()
 		delete(s.pending, id)
@@ -290,89 +390,130 @@ func (s *Service) accessCallback(ctx context.Context, b *bot.Bot, u *models.Upda
 	default:
 		return
 	}
-	if err := s.access.Upsert(rec); err != nil {
-		log.Printf("telegram access decision failed: %v", err)
-		return
-	}
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: rec.ChatID, Text: fmt.Sprintf("Access status: %s", rec.Status)})
+	s.send(ctx, &bot.SendMessageParams{ChatID: rec.ChatID, Text: fmt.Sprintf("Access status: %s", rec.Status)})
 }
 
-func (s *Service) disconnect(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if chat, ok := s.allowed(u); ok {
-		s.authorizationMu.Lock()
-		defer s.authorizationMu.Unlock()
-		if err := s.controller.Disconnect(); err != nil {
-			b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Disconnect failed: " + err.Error()})
-			return
-		}
-		s.sendStatus(ctx, b, chat)
-	}
-}
-
-func (s *Service) callback(ctx context.Context, b *bot.Bot, u *models.Update) {
-	if u.CallbackQuery == nil {
-		return
-	}
-	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: u.CallbackQuery.ID})
-	if chat, ok := s.allowed(u); ok {
-		switch u.CallbackQuery.Data {
-		case "vpn:status", "menu:main":
-			s.sendStatus(ctx, b, chat)
-		case "vpn:connect":
-			s.connect(ctx, b, u)
-		case "vpn:disconnect":
-			s.disconnect(ctx, b, u)
-		case "vpn:otp":
-			s.otpPrompt(ctx, b, u)
-		}
-	}
-}
-func (s *Service) otpPrompt(ctx context.Context, b *bot.Bot, u *models.Update) {
-	chat, ok := s.allowed(u)
-	if !ok || !s.controller.Status().AwaitingOTP {
-		return
-	}
+func (s *Service) disconnect(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	s.authorizationMu.Lock()
 	defer s.authorizationMu.Unlock()
-	msg, err := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the next GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
+	chat, ok := s.allowed(u)
+	if !ok {
+		return
+	}
+	s.disconnectLocked(ctx, chat)
+}
+
+func (s *Service) disconnectLocked(ctx context.Context, chat int64) {
+	if err := s.controller.Disconnect(); err != nil {
+		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Disconnect failed: " + err.Error()})
+		return
+	}
+	s.sendStatus(ctx, chat)
+}
+
+func (s *Service) callback(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	if u == nil || u.CallbackQuery == nil {
+		return
+	}
+	s.answerCallback(ctx, u.CallbackQuery.ID)
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
+	chat, ok := s.allowed(u)
+	if !ok {
+		return
+	}
+	_, userID, _ := privateIdentity(u)
+	switch u.CallbackQuery.Data {
+	case "vpn:status", "menu:main":
+		s.sendStatus(ctx, chat)
+	case "vpn:connect":
+		s.connectLocked(ctx, chat, userID)
+	case "vpn:disconnect":
+		s.disconnectLocked(ctx, chat)
+	case "vpn:otp":
+		s.otpPromptLocked(ctx, chat, userID)
+	}
+}
+
+func (s *Service) otpPrompt(ctx context.Context, _ *bot.Bot, u *models.Update) {
+	s.authorizationMu.Lock()
+	defer s.authorizationMu.Unlock()
+	chat, ok := s.allowed(u)
+	if !ok {
+		return
+	}
+	_, userID, _ := privateIdentity(u)
+	s.otpPromptLocked(ctx, chat, userID)
+}
+
+func (s *Service) otpPromptLocked(ctx context.Context, chat, userID int64) {
+	if !s.controller.Status().AwaitingOTP {
+		return
+	}
+	msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the next GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
 	if err != nil {
 		return
 	}
 	s.mu.Lock()
-	s.pending[u.CallbackQuery.From.ID] = pendingOTP{ChatID: chat, PromptMessageID: msg.ID, Kind: "followup", ExpiresAt: time.Now().Add(120 * time.Second)}
+	s.pending[userID] = pendingOTP{ChatID: chat, PromptMessageID: msg.ID, Kind: "followup", ExpiresAt: s.now().Add(120 * time.Second)}
 	s.mu.Unlock()
 }
 
-func (s *Service) sendMenu(ctx context.Context, b *bot.Bot, chat int64) { s.sendStatus(ctx, b, chat) }
-func (s *Service) sendStatus(ctx context.Context, b *bot.Bot, chat int64) {
+func (s *Service) send(ctx context.Context, params *bot.SendMessageParams) {
+	_, _ = s.bot.SendMessage(ctx, params)
+}
+
+func (s *Service) answerCallback(ctx context.Context, id string) {
+	_, _ = s.bot.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: id})
+}
+
+func (s *Service) sendMenu(ctx context.Context, chat int64) { s.sendStatus(ctx, chat) }
+
+func (s *Service) sendStatus(ctx context.Context, chat int64) {
 	st := s.controller.Status()
 	text := fmt.Sprintf("GlobalProtect · %s\n%s", strings.ToUpper(string(st.State)), st.Detail)
-	buttons := []models.InlineKeyboardButton{{Text: "Status", CallbackData: "vpn:status"}}
+	buttons := []models.InlineKeyboardButton{{Text: "Status", CallbackData: "vpn:status", Style: "primary"}}
 	switch st.State {
 	case vpn.StateDisconnected, vpn.StateError:
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Connect", CallbackData: "vpn:connect"})
+		buttons = append(buttons, models.InlineKeyboardButton{Text: "Connect", CallbackData: "vpn:connect", Style: "success"})
 	case vpn.StateConnecting:
 		if st.AwaitingOTP {
-			buttons = append(buttons, models.InlineKeyboardButton{Text: "Enter OTP", CallbackData: "vpn:otp"})
+			buttons = append(buttons, models.InlineKeyboardButton{Text: "Enter OTP", CallbackData: "vpn:otp", Style: "primary"})
 		}
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect"})
+		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
 	case vpn.StateConnected:
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect"})
+		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
 	}
-	b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: text, ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{buttons}}})
+	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: text, ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{buttons}}})
 }
+
 func (s *Service) notify(e vpn.Event) {
-	s.eventMu.Lock()
-	if s.eventStopping {
-		s.eventMu.Unlock()
-		return
+	// State changes invalidate prompts that no longer match the VPN's needs.
+	s.mu.Lock()
+	for id, prompt := range s.pending {
+		if prompt.Kind == "followup" && !e.Status.AwaitingOTP || prompt.Kind == "initial" && e.Kind == vpn.EventKindState {
+			delete(s.pending, id)
+		}
 	}
-	s.events = append(s.events, e)
-	s.eventCond.Signal()
+	s.mu.Unlock()
+
+	s.eventMu.Lock()
+	if !s.eventStopping {
+		s.events = append(s.events, e)
+		s.eventCond.Signal()
+	}
 	s.eventMu.Unlock()
 }
 
 func (s *Service) dispatchEvents(ctx context.Context) {
+	stopCancellationWakeup := context.AfterFunc(ctx, func() {
+		s.eventMu.Lock()
+		s.eventStopping = true
+		s.eventCond.Broadcast()
+		s.eventMu.Unlock()
+	})
+	defer stopCancellationWakeup()
+
 	for {
 		s.eventMu.Lock()
 		for s.eventHead == len(s.events) && !s.eventStopping {
@@ -384,30 +525,38 @@ func (s *Service) dispatchEvents(ctx context.Context) {
 		}
 		e := s.events[s.eventHead]
 		s.eventHead++
+		s.eventInFlight = true
+		s.eventMu.Unlock()
+
+		recipientSet := map[int64]struct{}{s.ownerID: {}}
+		for _, r := range s.access.Snapshot() {
+			if r.Status == AccessApproved {
+				recipientSet[r.ChatID] = struct{}{}
+			}
+		}
+		recipients := make([]int64, 0, len(recipientSet))
+		for chat := range recipientSet {
+			recipients = append(recipients, chat)
+		}
+		sort.Slice(recipients, func(i, j int) bool { return recipients[i] < recipients[j] })
+		text := fmt.Sprintf("GlobalProtect · %s\n%s", strings.ToUpper(e.Name), e.Detail)
+		for _, chat := range recipients {
+			if _, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: text}); err != nil {
+				log.Printf("telegram notification failed chat=%d error=%T", chat, err)
+			}
+		}
+
+		s.eventMu.Lock()
+		s.eventInFlight = false
 		if s.eventHead > 64 && s.eventHead*2 >= len(s.events) {
 			s.events = append([]vpn.Event(nil), s.events[s.eventHead:]...)
 			s.eventHead = 0
 		}
+		s.eventCond.Broadcast()
 		s.eventMu.Unlock()
-
-		s.mu.Lock()
-		recipients := []int64{s.ownerID}
-		for _, r := range s.access.Snapshot() {
-			if r.Status == AccessApproved && r.UserID != s.ownerID {
-				recipients = append(recipients, r.ChatID)
-			}
-		}
-		b := s.bot
-		s.mu.Unlock()
-		sort.Slice(recipients, func(i, j int) bool { return recipients[i] < recipients[j] })
-		text := fmt.Sprintf("GlobalProtect · %s\n%s", strings.ToUpper(e.Name), e.Detail)
-		for _, chat := range recipients {
-			if _, err := b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: text}); err != nil {
-				log.Printf("telegram notification failed chat=%d: %v", chat, err)
-			}
-		}
 	}
 }
+
 func displayName(u *models.User) string {
 	if u.FirstName+" "+u.LastName != " " {
 		return strings.TrimSpace(u.FirstName + " " + u.LastName)

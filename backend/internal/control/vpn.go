@@ -14,8 +14,17 @@ type ConnectOptions struct {
 	AutoReconnect *bool
 }
 
+type manager interface {
+	Connect(vpn.ConnectRequest) error
+	SubmitOTP(string) error
+	Disconnect() error
+	GetStatus() vpn.Status
+	GetLogs() []string
+	OnEvent(func(vpn.Event))
+}
+
 type VPN struct {
-	manager *vpn.Manager
+	manager manager
 	config  *config.Manager
 }
 

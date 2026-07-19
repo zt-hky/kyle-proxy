@@ -1085,10 +1085,16 @@ func (m *Manager) addLog(line string) {
 
 func sanitizeLogLine(line string) string {
 	lower := strings.ToLower(line)
+	headerIndex, headerLength := -1, 0
 	for _, header := range []string{"cookie:", "set-cookie:", "authorization:"} {
-		if idx := strings.Index(lower, header); idx >= 0 {
-			return line[:idx+len(header)] + " [redacted]"
+		if idx := strings.Index(lower, header); idx >= 0 && (headerIndex < 0 || idx < headerIndex) {
+			headerIndex = idx
+			headerLength = len(header)
 		}
+	}
+	if headerIndex >= 0 {
+		prefix := sensitiveLogValueRE.ReplaceAllString(line[:headerIndex+headerLength], "$1$2[redacted]")
+		return prefix + " [redacted]"
 	}
 	return sensitiveLogValueRE.ReplaceAllString(line, "$1$2[redacted]")
 }
