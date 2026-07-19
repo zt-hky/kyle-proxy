@@ -1,11 +1,11 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  Kyle VPN Proxy — Container Entrypoint
+#  GlobalProtect Manager — Container Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo " Kyle VPN Proxy"
+echo " GlobalProtect Manager"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 # ── 1. Install custom CA certificates ────────────────────────────────────────
@@ -51,5 +51,5 @@ fi
 mkdir -p /data/certs
 
 # ── 5. Start the main application ─────────────────────────────────────────────
-echo "[START] Launching kyle-proxy on :8888 …"
-exec /usr/local/bin/kyle-proxy "$@"
+echo "[START] Launching globalprotect-manager on :8888 …"
+exec /usr/local/bin/globalprotect-manager "$@"

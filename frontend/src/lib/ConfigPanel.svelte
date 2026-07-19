@@ -8,8 +8,6 @@
     portal: '', gateway: '', username: '', password: '',
     otp_secret: '', clear_otp_secret: false, auto_reconnect: false,
     cert_file: '', trust_cert: false, extra_args: [],
-    http_port: 8080, socks5_port: 1080,
-    vmess_port: 8388, server_host: '',
   }
   let extraArgsStr = ''
   let hasPass = false
@@ -34,10 +32,6 @@
         cert_file: data.cert_file ?? '',
         trust_cert: data.trust_cert ?? false,
         extra_args: data.extra_args ?? [],
-        http_port: data.http_port ?? 8080,
-        socks5_port: data.socks5_port ?? 1080,
-        vmess_port: data.vmess_port ?? 8388,
-        server_host: data.server_host ?? '',
       }
       hasPass = data.has_password ?? false
       hasOtpSecret = data.has_otp_secret ?? false
@@ -163,29 +157,6 @@
   </div>
 </div>
 
-<!-- Proxy Port Settings -->
-<div class="card">
-  <h3>📡 Proxy Ports (v2ray)</h3>
-  <div class="two-col">
-    <div class="form-row">
-      <label for="httpPort">HTTP Proxy Port</label>
-      <input id="httpPort" type="number" min="1024" max="65535" bind:value={cfg.http_port} />
-    </div>
-    <div class="form-row">
-      <label for="socksPort">SOCKS5 Proxy Port</label>
-      <input id="socksPort" type="number" min="1024" max="65535" bind:value={cfg.socks5_port} />
-    </div>
-    <div class="form-row">
-      <label for="vmessPort">VMess Port</label>
-      <input id="vmessPort" type="number" min="1024" max="65535" bind:value={cfg.vmess_port} />
-    </div>
-    <div class="form-row">
-      <label for="serverHost">Public Host (for vmess:// sharing)</label>
-      <input id="serverHost" type="text" placeholder="e.g. 192.168.1.100 or vpn.home.lan" bind:value={cfg.server_host} />
-    </div>
-  </div>
-  <p class="hint">Leave <em>Public Host</em> empty to auto-detect the server IP. Set it if clients connect via a fixed hostname or public IP.</p>
-</div>
 
 <!-- Custom TLS Certificate -->
 <div class="card">
@@ -211,7 +182,6 @@
 </div>
 
 <style>
-  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .hint { color: #94a3b8; font-size: 13px; margin-bottom: 12px; }
   .current-cert { font-size: 12px; color: #64748b; margin-bottom: 8px; }
   .current-cert code { background: #0f172a; padding: 2px 6px; border-radius: 4px; }
@@ -244,5 +214,4 @@
     padding: 8px 12px;
     font-size: 12px;
   }
-  @media (max-width: 480px) { .two-col { grid-template-columns: 1fr; } }
 </style>

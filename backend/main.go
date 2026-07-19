@@ -8,15 +8,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"kyle-proxy/internal/api"
-	"kyle-proxy/internal/auth"
-	"kyle-proxy/internal/config"
-	"kyle-proxy/internal/proxy"
-	"kyle-proxy/internal/users"
-	"kyle-proxy/internal/vpn"
+	"globalprotect-manager/internal/api"
+	"globalprotect-manager/internal/auth"
+	"globalprotect-manager/internal/config"
+	"globalprotect-manager/internal/control"
+	"globalprotect-manager/internal/telegram"
+	"globalprotect-manager/internal/vpn"
 )
 
 //go:embed static
@@ -24,101 +25,75 @@ var embeddedStatic embed.FS
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("🚀 Kyle VPN Proxy starting…")
-
-	// ── Config ───────────────────────────────────────────────────────────────
-	cfgPath := envOr("CONFIG_PATH", "/data/config.json")
-	cfgMgr := config.NewManager(cfgPath)
-	cfg := cfgMgr.Load()
-
-	// ── VPN manager ──────────────────────────────────────────────────────────
+	log.Println("GlobalProtect Manager starting")
+	cfgMgr := config.NewManager(envOr("CONFIG_PATH", "/data/config.json"))
+	cfgMgr.Load()
 	vpnMgr := vpn.NewManager()
-
-	// ── Proxy manager ────────────────────────────────────────────────────────
-	proxyMgr := proxy.NewManager(proxy.Config{
-		HTTPPort:   cfg.Proxy.HTTPPort,
-		Socks5Port: cfg.Proxy.Socks5Port,
-		VMessPort:  cfg.Proxy.VMessPort,
-	})
-
-	// ── User store ───────────────────────────────────────────────────────────
-	usersPath := envOr("USERS_PATH", "/data/users.json")
-	userStore, err := users.NewStore(usersPath)
-	if err != nil {
-		log.Printf("⚠️  Could not load user store: %v (starting empty)", err)
-		userStore, _ = users.NewStore("") // in-memory fallback
-	}
-
-	// ── GitHub OAuth ─────────────────────────────────────────────────────────
+	controller := control.NewVPN(vpnMgr, cfgMgr)
 	ghAuth := auth.NewGitHubAuth()
 	if ghAuth.Enabled {
-		log.Println("🔐 GitHub OAuth2 authentication enabled")
+		log.Println("GitHub OAuth2 authentication enabled")
 	} else {
-		log.Println("⚠️  GitHub auth not configured — management UI is unprotected")
+		log.Println("GitHub auth not configured — management UI is unprotected")
 	}
 
-	// ── Start proxy with current users ───────────────────────────────────────
-	if accts := userStore.AccountsForV2Ray(); len(accts) > 0 {
-		mapped := make([]proxy.UserAccount, len(accts))
-		for i, a := range accts {
-			mapped[i] = proxy.UserAccount{Username: a.Username, Token: a.Token, VMessUUID: a.VMessUUID, Patterns: a.Patterns}
+	var botSvc *telegram.Service
+	token, ownerText := os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_OWNER_ID")
+	if token == "" && ownerText == "" {
+		log.Println("Telegram bot disabled")
+	} else if token == "" || ownerText == "" {
+		log.Println("Telegram bot disabled: token and owner ID are both required")
+	} else if ownerID, err := strconv.ParseInt(ownerText, 10, 64); err != nil || ownerID <= 0 {
+		log.Printf("Telegram bot disabled: invalid owner ID")
+	} else {
+		botSvc, err = telegram.New(token, ownerID, envOr("TELEGRAM_ACCESS_PATH", "/data/telegram-access.json"), controller)
+		if err != nil {
+			log.Printf("Telegram bot disabled: %v", err)
 		}
-		proxyMgr.SetAccountsSilent(mapped) // set before Start so first config write includes users
 	}
 
-	if err := proxyMgr.Start(); err != nil {
-		log.Printf("⚠️  v2ray failed to start: %v (proxy will be unavailable)", err)
-	}
-
-	// ── Static frontend ──────────────────────────────────────────────────────
 	var staticFS fs.FS
-	sub, err := fs.Sub(embeddedStatic, "static")
-	if err == nil {
-		if f, err2 := sub.Open("index.html"); err2 == nil {
+	if sub, err := fs.Sub(embeddedStatic, "static"); err == nil {
+		if f, e := sub.Open("index.html"); e == nil {
 			f.Close()
 			staticFS = sub
-			log.Println("📦 Serving embedded Svelte frontend")
-		} else {
-			log.Println("⚠️  No embedded frontend found — run 'make build-frontend' first")
+			log.Println("Serving embedded Svelte frontend")
 		}
 	}
-
-	// ── HTTP server ──────────────────────────────────────────────────────────
-	addr := envOr("LISTEN_ADDR", ":8888")
-	router := api.NewRouter(vpnMgr, proxyMgr, cfgMgr, userStore, ghAuth, staticFS)
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: router,
+	router := api.NewRouter(controller, cfgMgr, ghAuth, staticFS)
+	srv := &http.Server{Addr: envOr("LISTEN_ADDR", ":8888"), Handler: router}
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	defer pollCancel()
+	if botSvc != nil {
+		go botSvc.Start(pollCtx)
 	}
-
-	// ── Graceful shutdown ─────────────────────────────────────────────────────
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	go func() {
-		log.Printf("🌐 Management UI → http://0.0.0.0%s", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			log.Printf("HTTP server error: %v", err)
 		}
 	}()
-
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	<-ctx.Done()
-	log.Println("Shutting down…")
-
-	_ = vpnMgr.Disconnect()
-	proxyMgr.Stop()
-
-	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	log.Println("Shutting down")
+	if botSvc != nil {
+		botSvc.BeginShutdown()
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutCtx)
-
-	log.Println("Bye!")
+	_ = srv.Shutdown(shutdownCtx)
+	_ = controller.Disconnect()
+	if botSvc != nil {
+		flushCtx, fc := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = botSvc.Flush(flushCtx)
+		fc()
+		pollCancel()
+	}
+	log.Println("Bye")
 }
-
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
 }
-

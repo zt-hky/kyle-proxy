@@ -2,7 +2,7 @@
 *.local
 
 # Go
-backend/kyle-proxy
+backend/globalprotect-manager
 backend/vendor/
 
 # Node / Svelte build output

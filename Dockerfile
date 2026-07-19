@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-#  Kyle VPN Proxy — Multi-arch (amd64 / arm64) Container
+#  GlobalProtect Manager — Multi-arch (amd64 / arm64) Container
 #
 #  Build stages (ordered for maximum layer-cache reuse):
 #    1. node-builder  — npm ci + vite build  (cache busted by package*.json / src)
 #    2. go-builder    — go mod download + go build  (cache busted by go.mod / src)
 #    3. openconnect-builder — build newer OpenConnect with GP HTML MFA fixes
-#    4. downloader    — curl v2ray + gpclient  (cache busted by version ARGs only)
+#    4. downloader    — curl gpclient binaries (cache busted by version ARGs only)
 #    5. runtime       — system deps -> versioned bins -> app binary
 #
 #  Cache strategy:
@@ -44,7 +44,7 @@ COPY --from=node-builder /app/backend/static ./static
 ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o kyle-proxy .
+    go build -ldflags="-s -w" -o globalprotect-manager .
 
 # ── 3. Build OpenConnect with GlobalProtect HTML-wrapped MFA support ─────────
 # Debian Bookworm ships OpenConnect 9.01, which fails to parse some PAN
@@ -84,32 +84,18 @@ RUN set -eux; \
     ldconfig; \
     /usr/local/bin/openconnect --version
 
-# ── 4. Download external binaries ────────────────────────────────────────────
+# ── 4. Download GlobalProtect client binaries ────────────────────────────────
 # Isolated stage: slow network fetches only re-run when version ARGs change,
-# not on source-code changes. curl/unzip are NOT carried into the runtime image.
+# not on source-code changes. curl is NOT carried into the runtime image.
 FROM debian:bookworm-slim AS downloader
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl unzip \
+        ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Placeholder files ensure COPY --from=downloader never fails (e.g. arm/v7)
 RUN mkdir -p /dl && touch /dl/gpclient /dl/gpauth
 
-# v2ray — https://github.com/v2fly/v2ray-core/releases
-ARG V2RAY_VERSION=5.16.1
 ARG TARGETARCH
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-        amd64)  V2RAY_ARCH="64" ;; \
-        arm64)  V2RAY_ARCH="arm64-v8a" ;; \
-        arm)    V2RAY_ARCH="arm32-v7a" ;; \
-        *)      echo "Unsupported arch: ${TARGETARCH}" && exit 1 ;; \
-    esac; \
-    curl -fsSL -o /tmp/v2ray.zip \
-        "https://github.com/v2fly/v2ray-core/releases/download/v${V2RAY_VERSION}/v2ray-linux-${V2RAY_ARCH}.zip"; \
-    unzip -q /tmp/v2ray.zip -d /tmp/v2ray; \
-    install -m755 /tmp/v2ray/v2ray /dl/v2ray; \
-    rm -rf /tmp/v2ray /tmp/v2ray.zip
 
 # gpclient + gpauth — https://github.com/yuezk/GlobalProtect-openconnect/releases
 ARG GP_VERSION=2.0.1
@@ -162,21 +148,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=openconnect-builder /usr/local /usr/local
 RUN ldconfig && openconnect --version
 
-# Versioned binaries — layer invalidated only when V2RAY_VERSION / GP_VERSION change
-COPY --from=downloader /dl/v2ray    /usr/local/bin/v2ray
+# Versioned binaries — layer invalidated only when GP_VERSION changes
 COPY --from=downloader /dl/gpclient /usr/local/bin/gpclient
 COPY --from=downloader /dl/gpauth   /usr/local/bin/gpauth
-RUN chmod +x /usr/local/bin/v2ray \
-    && chmod +x /usr/local/bin/gpclient /usr/local/bin/gpauth 2>/dev/null || true
+RUN chmod +x /usr/local/bin/gpclient /usr/local/bin/gpauth 2>/dev/null || true
 
 # Application binary — changes most frequently; placed last to minimise cache busting
-COPY --from=go-builder /app/backend/kyle-proxy /usr/local/bin/kyle-proxy
+COPY --from=go-builder /app/backend/globalprotect-manager /usr/local/bin/globalprotect-manager
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 VOLUME ["/data"]
-# 8888 = Web UI  |  8080 = HTTP proxy  |  1080 = SOCKS5  |  8388 = VMess
-EXPOSE 8888 8080 1080 8388
+# 8888 = Web management UI
+EXPOSE 8888
 # Requires: --cap-add NET_ADMIN  and  --device /dev/net/tun
 ENTRYPOINT ["/entrypoint.sh"]

@@ -1,19 +1,17 @@
 services:
-  kyle-proxy:
-    image: kyle-proxy:latest
+  globalprotect-manager:
+    image: globalprotect-manager:latest
     build:
       context: .
       dockerfile: Dockerfile
       # To build for ARM64 (TV Box):
-      #   docker buildx build --platform linux/arm64 -t kyle-proxy:arm64 .
-    container_name: kyle-proxy
+      #   docker buildx build --platform linux/arm64 -t globalprotect-manager:arm64 .
+    container_name: globalprotect-manager
     restart: unless-stopped
+    stop_grace_period: 25s
 
     ports:
       - "8888:8888"   # Web management UI
-      - "8080:8080"   # HTTP proxy  → set on iPhone as HTTP proxy
-      - "1080:1080"   # SOCKS5 proxy
-      - "8388:8388"   # VMess proxy → import vmess:// link in v2box / v2rayNG
 
     # ── Required for VPN/TUN ─────────────────────────────────────────────────
     cap_add:
@@ -21,19 +19,19 @@ services:
       - SYS_PTRACE  # allows gpclient to inspect its own process
     devices:
       - /dev/net/tun:/dev/net/tun
-    sysctls:
-      - net.ipv4.ip_forward=1
 
     # ── Persistent data ──────────────────────────────────────────────────────
     volumes:
-      - kyle-proxy-data:/data
+      - globalprotect-manager-data:/data
       # Optional: mount your own certs directory
       # - ./certs:/data/certs:ro
 
     environment:
       - CONFIG_PATH=/data/config.json
-      - USERS_PATH=/data/users.json
       - LISTEN_ADDR=:8888
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID:-}
+      - TELEGRAM_ACCESS_PATH=${TELEGRAM_ACCESS_PATH:-/data/telegram-access.json}
       # ── GitHub OAuth (optional — protects the management UI) ──────────────
       # Create an OAuth App at https://github.com/settings/developers
       # Callback URL: http://<your-host>:8888/auth/callback
@@ -42,9 +40,6 @@ services:
       # - GITHUB_ALLOWED_USERS=your_github_username,coworker_username
       # - AUTH_SECRET=change-this-to-a-random-secret   # JWT signing secret
       # - PUBLIC_URL=http://192.168.1.100:8888          # needed if behind NAT
-      # Optional: pre-configure VPN (can also be set via the web UI)
-      # - GP_PORTAL=vpn.company.com
-      # - GP_USERNAME=user@company.com
 
     # ── Resource limits (for TV box: 2 GB RAM / 4 cores) ────────────────────
     deploy:
@@ -64,5 +59,6 @@ services:
       start_period: 10s
 
 volumes:
-  kyle-proxy-data:
+  globalprotect-manager-data:
+    name: globalprotect-manager-data
     driver: local

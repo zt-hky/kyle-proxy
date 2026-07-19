@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestOTPInputs(t *testing.T) {
@@ -185,6 +187,124 @@ func TestRequestedDisconnectIsNotReconnectable(t *testing.T) {
 	err := classifyOpenConnectExit(errors.New("signal: terminated"), StateDisconnecting, true, true)
 	if err != nil {
 		t.Fatalf("requested disconnect returned an error: %v", err)
+	}
+}
+
+func TestEventsAreFIFOAndCallbacksDoNotHoldManagerLock(t *testing.T) {
+	m := NewManager()
+	events := make(chan Event, 4)
+	m.OnEvent(func(event Event) {
+		_ = m.GetStatus()
+		events <- event
+	})
+
+	m.setState(StateConnecting, "")
+	m.setPhase("auth", "Waiting for authentication")
+	m.setPhase("auth", "Waiting for authentication")
+
+	first := receiveManagerEvent(t, events)
+	second := receiveManagerEvent(t, events)
+	if first.ID != 1 || second.ID != 2 {
+		t.Fatalf("event IDs = %d, %d, want FIFO IDs 1, 2", first.ID, second.ID)
+	}
+	if first.Kind != EventKindState || first.Name != string(StateConnecting) {
+		t.Fatalf("first event = %#v, want connecting state", first)
+	}
+	if second.Kind != EventKindPhase || second.Name != "auth" {
+		t.Fatalf("second event = %#v, want auth phase", second)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("duplicate phase event = %#v", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestEventsQueuedBeforeCallbackRegistrationAndSanitized(t *testing.T) {
+	m := NewManager()
+	m.setState(StateError, "password=super-secret otp=123456")
+
+	events := make(chan Event, 2)
+	m.OnEvent(func(event Event) {
+		events <- event
+	})
+	stateEvent := receiveManagerEvent(t, events)
+	phaseEvent := receiveManagerEvent(t, events)
+	for _, event := range []Event{stateEvent, phaseEvent} {
+		serialized := event.Detail + event.Status.Error + event.Status.Detail + event.Status.LastLog
+		if strings.Contains(serialized, "super-secret") || strings.Contains(serialized, "123456") {
+			t.Fatalf("event leaked secret: %#v", event)
+		}
+	}
+	if stateEvent.ID != 1 || phaseEvent.ID != 2 {
+		t.Fatalf("queued event IDs = %d, %d, want 1, 2", stateEvent.ID, phaseEvent.ID)
+	}
+}
+
+func TestActionEventsReportRejectedAndNoop(t *testing.T) {
+	m := NewManager()
+	events := make(chan Event, 2)
+	m.OnEvent(func(event Event) {
+		events <- event
+	})
+
+	if err := m.SubmitOTP(""); err == nil {
+		t.Fatal("empty OTP unexpectedly succeeded")
+	}
+	if err := m.Disconnect(); err != nil {
+		t.Fatalf("disconnect from disconnected state failed: %v", err)
+	}
+
+	rejected := receiveManagerEvent(t, events)
+	noOp := receiveManagerEvent(t, events)
+	if rejected.Kind != EventKindAction || rejected.Name != "submit_otp" || rejected.Outcome != "rejected" {
+		t.Fatalf("rejected action event = %#v", rejected)
+	}
+	if noOp.Kind != EventKindAction || noOp.Name != "disconnect" || noOp.Outcome != "noop" {
+		t.Fatalf("no-op action event = %#v", noOp)
+	}
+}
+
+func TestDuplicateOTPPromptEmitsOneOTPEvent(t *testing.T) {
+	m := NewManager()
+	m.mu.Lock()
+	m.state = StateConnecting
+	m.mu.Unlock()
+	events := make(chan Event, 4)
+	m.OnEvent(func(event Event) {
+		events <- event
+	})
+
+	m.noteOTPPrompt()
+	m.noteOTPPrompt()
+	received := []Event{receiveManagerEvent(t, events), receiveManagerEvent(t, events)}
+	otpCount := 0
+	for _, event := range received {
+		if event.Kind == EventKindOTP {
+			otpCount++
+			if event.Name != "prompt" {
+				t.Fatalf("OTP event = %#v, want prompt", event)
+			}
+		}
+	}
+	if otpCount != 1 {
+		t.Fatalf("OTP event count = %d, want one", otpCount)
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("duplicate OTP prompt event = %#v", event)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func receiveManagerEvent(t *testing.T, events <-chan Event) Event {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for VPN event")
+		return Event{}
 	}
 }
 

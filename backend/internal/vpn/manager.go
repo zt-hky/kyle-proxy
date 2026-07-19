@@ -91,23 +91,98 @@ type Manager struct {
 	gatewayPasswordSent bool
 	sawGatewayLogin     bool
 	sawParseError       bool
-	onStateChange       func(State)
+
+	eventSeq   uint64
+	eventQueue []Event
+	eventHead  int
+	eventCond  *sync.Cond
+	onEvent    func(Event)
+}
+
+// EventKind identifies the lifecycle stream that produced an event.
+type EventKind string
+
+const (
+	EventKindAction    EventKind = "action"
+	EventKindState     EventKind = "state"
+	EventKindPhase     EventKind = "phase"
+	EventKindOTP       EventKind = "otp"
+	EventKindReconnect EventKind = "reconnect"
+)
+
+// Event is a sanitized snapshot of an observable VPN lifecycle change.
+type Event struct {
+	ID      uint64    `json:"id"`
+	Kind    EventKind `json:"kind"`
+	Name    string    `json:"name"`
+	Outcome string    `json:"outcome,omitempty"`
+	At      time.Time `json:"at"`
+	Status  Status    `json:"status"`
+	Detail  string    `json:"detail,omitempty"`
 }
 
 // NewManager creates a new VPN manager
 func NewManager() *Manager {
-	return &Manager{
+	m := &Manager{
 		state:           StateDisconnected,
 		logs:            make([]string, 0, 500),
+		eventQueue:      make([]Event, 0),
 		lastAutoOTPStep: -1,
+	}
+	m.eventCond = sync.NewCond(&m.mu)
+	go m.dispatchEvents()
+	return m
+}
+
+// OnEvent registers the callback that receives ordered lifecycle events.
+func (m *Manager) OnEvent(fn func(Event)) {
+	m.mu.Lock()
+	if m.eventCond == nil {
+		m.eventCond = sync.NewCond(&m.mu)
+	}
+	m.onEvent = fn
+	m.eventCond.Broadcast()
+	m.mu.Unlock()
+}
+
+// dispatchEvents drains the event queue without holding Manager.mu while
+// invoking user code. Events remain queued until a callback is registered.
+func (m *Manager) dispatchEvents() {
+	for {
+		m.mu.Lock()
+		for (m.eventHead >= len(m.eventQueue) || m.onEvent == nil) && m.eventCond != nil {
+			m.eventCond.Wait()
+		}
+		if m.eventHead >= len(m.eventQueue) {
+			m.mu.Unlock()
+			continue
+		}
+		event := m.eventQueue[m.eventHead]
+		m.eventQueue[m.eventHead] = Event{}
+		m.eventHead++
+		m.compactEventsLocked()
+		callback := m.onEvent
+		m.mu.Unlock()
+		if callback != nil {
+			callback(event)
+		}
 	}
 }
 
-// OnStateChange registers a callback triggered when state changes
-func (m *Manager) OnStateChange(fn func(State)) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.onStateChange = fn
+func (m *Manager) compactEventsLocked() {
+	if m.eventHead == len(m.eventQueue) {
+		m.eventQueue = m.eventQueue[:0]
+		m.eventHead = 0
+		return
+	}
+	if m.eventHead < 64 || m.eventHead*2 < len(m.eventQueue) {
+		return
+	}
+	remaining := len(m.eventQueue) - m.eventHead
+	copy(m.eventQueue, m.eventQueue[m.eventHead:])
+	clear(m.eventQueue[remaining:])
+	m.eventQueue = m.eventQueue[:remaining]
+	m.eventHead = 0
 }
 
 // GetStatus returns the current VPN status
@@ -146,29 +221,166 @@ func (m *Manager) GetLogs() []string {
 	copy(result, m.logs)
 	return result
 }
+func (m *Manager) statusSnapshotLocked() Status {
+	s := Status{
+		State:            m.state,
+		Phase:            m.phase,
+		Detail:           sanitizeLogLine(m.detail),
+		LastLog:          sanitizeLogLine(m.lastLog),
+		Interface:        m.tunInterface,
+		AwaitingOTP:      m.awaitingOTP,
+		OTPPromptCount:   m.otpPromptCount,
+		AutoOTP:          m.otpSecret != "",
+		AutoReconnect:    m.autoReconnect,
+		ReconnectAttempt: m.reconnectAttempt,
+	}
+	if m.state == StateConnected && !m.connectedAt.IsZero() {
+		s.Since = m.connectedAt.Format(time.RFC3339)
+	}
+	return s
+}
+
+func (m *Manager) enqueueEventLocked(kind EventKind, name, outcome, detail string) {
+	if m.eventCond == nil {
+		m.eventCond = sync.NewCond(&m.mu)
+	}
+	m.eventSeq++
+	m.eventQueue = append(m.eventQueue, Event{
+		ID:      m.eventSeq,
+		Kind:    kind,
+		Name:    name,
+		Outcome: outcome,
+		At:      time.Now(),
+		Status:  m.statusSnapshotLocked(),
+		Detail:  sanitizeLogLine(detail),
+	})
+	m.eventCond.Signal()
+}
+
+func (m *Manager) emitActionLocked(name, outcome, detail string) {
+	m.enqueueEventLocked(EventKindAction, name, outcome, detail)
+}
+
+func (m *Manager) emitOTPLocked(name, detail string) {
+	m.enqueueEventLocked(EventKindOTP, name, "", detail)
+}
+
+func (m *Manager) emitReconnectLocked(name, detail string) {
+	m.enqueueEventLocked(EventKindReconnect, name, "", detail)
+}
+
+func (m *Manager) setPhaseLocked(phase, detail string) {
+	if m.phase == phase && m.detail == detail {
+		return
+	}
+	m.phase = phase
+	m.detail = detail
+	m.enqueueEventLocked(EventKindPhase, phase, "", detail)
+}
+func (m *Manager) setPhase(phase, detail string) {
+	m.mu.Lock()
+	m.setPhaseLocked(phase, detail)
+	m.mu.Unlock()
+}
+
+func (m *Manager) setAwaitingOTPLocked(awaiting bool) {
+	m.awaitingOTP = awaiting
+}
+
+func (m *Manager) setReconnectAttemptLocked(attempt int) {
+	m.reconnectAttempt = attempt
+}
+
+func (m *Manager) setStateLocked(s State, errMsg string) {
+	stateChanged := m.state != s || m.errorMsg != errMsg
+	oldPhase, oldDetail := m.phase, m.detail
+	m.state = s
+	m.errorMsg = errMsg
+	if s == StateDisconnected {
+		m.phase = ""
+		m.detail = ""
+		m.setAwaitingOTPLocked(false)
+	}
+	if s == StateError && errMsg != "" {
+		m.phase = "error"
+		m.detail = errMsg
+		m.setAwaitingOTPLocked(false)
+	}
+	phaseChanged := oldPhase != m.phase || oldDetail != m.detail
+	if stateChanged {
+		detail := errMsg
+		if detail == "" {
+			detail = string(s)
+		}
+		m.enqueueEventLocked(EventKindState, string(s), "", detail)
+	}
+	if phaseChanged {
+		m.enqueueEventLocked(EventKindPhase, m.phase, "", m.detail)
+	}
+}
+
+func (m *Manager) setState(s State, errMsg string) {
+	m.mu.Lock()
+	m.setStateLocked(s, errMsg)
+	m.mu.Unlock()
+}
+
+func (m *Manager) markConnected(iface string) {
+	m.mu.Lock()
+	wasConnected := m.state == StateConnected
+	oldPhase, oldDetail := m.phase, m.detail
+	oldState, oldError := m.state, m.errorMsg
+	m.state = StateConnected
+	m.errorMsg = ""
+	m.connectedAt = time.Now()
+	m.tunInterface = iface
+	m.setAwaitingOTPLocked(false)
+	m.phase = "connected"
+	m.detail = "VPN tunnel established"
+	if oldState != m.state || oldError != m.errorMsg {
+		m.enqueueEventLocked(EventKindState, string(m.state), "", m.detail)
+	}
+	if oldPhase != m.phase || oldDetail != m.detail {
+		m.enqueueEventLocked(EventKindPhase, m.phase, "", m.detail)
+	}
+	reconnectAttempt := m.reconnectAttempt
+	if !wasConnected && reconnectAttempt > 0 {
+		m.emitReconnectLocked("established", fmt.Sprintf("Reconnect attempt %d established the VPN tunnel", reconnectAttempt))
+	}
+	m.mu.Unlock()
+}
 
 // Connect initiates a VPN connection asynchronously
 func (m *Manager) Connect(req ConnectRequest) error {
 	if req.AutoReconnect && strings.TrimSpace(req.OTPSecret) == "" {
-		return fmt.Errorf("auto reconnect requires a saved OTP secret")
+		err := fmt.Errorf("auto reconnect requires a saved OTP secret")
+		m.mu.Lock()
+		m.emitActionLocked("connect", "rejected", err.Error())
+		m.mu.Unlock()
+		return err
 	}
 
 	m.mu.Lock()
 	if m.state == StateConnecting || m.state == StateConnected {
+		err := fmt.Errorf("VPN already %s", m.state)
+		m.emitActionLocked("connect", "rejected", err.Error())
 		m.mu.Unlock()
-		return fmt.Errorf("VPN already %s", m.state)
+		return err
 	}
 	m.stopRequested = false
+	m.emitActionLocked("connect", "accepted", "VPN connection accepted")
+	m.setStateLocked(StateConnecting, "")
+	m.setPhaseLocked("starting", "Starting VPN connection")
 	m.mu.Unlock()
-
-	m.setState(StateConnecting, "")
-	m.setPhase("starting", "Starting VPN connection")
 	m.addLog("=== Starting VPN connection ===")
 
 	go func() {
 		if err := m.runConnectLoop(req); err != nil {
 			m.addLog(fmt.Sprintf("ERROR: %v", err))
-			m.setState(StateError, err.Error())
+			m.mu.Lock()
+			m.emitActionLocked("connect", "failed", err.Error())
+			m.setStateLocked(StateError, err.Error())
+			m.mu.Unlock()
 		}
 	}()
 
@@ -179,38 +391,55 @@ func (m *Manager) Connect(req ConnectRequest) error {
 func (m *Manager) SubmitOTP(otp string) error {
 	tokens := splitOTPValues(otp)
 	if len(tokens) == 0 {
-		return fmt.Errorf("OTP is required")
+		err := fmt.Errorf("OTP is required")
+		m.mu.Lock()
+		m.emitActionLocked("submit_otp", "rejected", err.Error())
+		m.mu.Unlock()
+		return err
 	}
 
 	m.mu.Lock()
 	if m.state != StateConnecting {
+		err := fmt.Errorf("VPN is not awaiting authentication input")
+		m.emitActionLocked("submit_otp", "rejected", err.Error())
 		m.mu.Unlock()
-		return fmt.Errorf("VPN is not awaiting authentication input")
+		return err
 	}
 	if !m.awaitingOTP {
 		detail := m.detail
 		if detail == "" {
 			detail = string(m.state)
 		}
+		err := fmt.Errorf("VPN is not waiting for OTP (current step: %s)", detail)
+		m.emitActionLocked("submit_otp", "rejected", err.Error())
 		m.mu.Unlock()
-		return fmt.Errorf("VPN is not waiting for OTP (current step: %s)", detail)
+		return err
 	}
 	stdin := m.stdin
 	if stdin == nil {
+		err := fmt.Errorf("VPN authentication input is not available")
+		m.emitActionLocked("submit_otp", "rejected", err.Error())
 		m.mu.Unlock()
-		return fmt.Errorf("VPN authentication input is not available")
+		return err
 	}
-	m.awaitingOTP = false
-	m.phase = "auth"
-	m.detail = "Submitted OTP; waiting for VPN server"
+	m.emitActionLocked("submit_otp", "accepted", "OTP submission accepted")
+	m.setAwaitingOTPLocked(false)
+	m.setPhaseLocked("auth", "Submitted OTP; waiting for VPN server")
 	m.mu.Unlock()
 
 	for _, token := range tokens {
 		if _, err := fmt.Fprintf(stdin, "%s\n", token); err != nil {
-			return fmt.Errorf("send OTP: %w", err)
+			sendErr := fmt.Errorf("send OTP: %w", err)
+			m.mu.Lock()
+			m.emitActionLocked("submit_otp", "failed", sendErr.Error())
+			m.mu.Unlock()
+			return sendErr
 		}
 		m.recordAuthResponse()
 	}
+	m.mu.Lock()
+	m.emitOTPLocked("submit", fmt.Sprintf("Submitted %d manual OTP response(s)", len(tokens)))
+	m.mu.Unlock()
 	m.addLog(fmt.Sprintf("MFA: submitted %d OTP response(s)", len(tokens)))
 	return nil
 }
@@ -221,20 +450,22 @@ func (m *Manager) Disconnect() error {
 	m.stopRequested = true
 	cmd := m.cmd
 	state := m.state
-	m.mu.Unlock()
-
 	if state == StateDisconnected || state == StateDisconnecting {
+		m.emitActionLocked("disconnect", "noop", fmt.Sprintf("VPN is already %s", state))
+		m.mu.Unlock()
 		return nil
 	}
+	m.emitActionLocked("disconnect", "accepted", "VPN disconnect accepted")
+	m.setStateLocked(StateDisconnecting, "")
+	m.mu.Unlock()
 
-	m.setState(StateDisconnecting, "")
 	m.addLog("=== Disconnecting VPN ===")
 
 	if cmd != nil && cmd.Process != nil {
 		m.mu.Lock()
 		stdin := m.stdin
 		m.stdin = nil
-		m.awaitingOTP = false
+		m.setAwaitingOTPLocked(false)
 		m.mu.Unlock()
 		if stdin != nil {
 			_ = stdin.Close()
@@ -266,9 +497,6 @@ func (m *Manager) Disconnect() error {
 	m.cmd = nil
 	m.stdin = nil
 	m.tunInterface = ""
-	m.phase = ""
-	m.detail = ""
-	m.awaitingOTP = false
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
 	m.credentialPrompts = 0
@@ -276,13 +504,13 @@ func (m *Manager) Disconnect() error {
 	m.otpSecret = ""
 	m.autoOTPInFlight = false
 	m.autoReconnect = false
-	m.reconnectAttempt = 0
+	m.setReconnectAttemptLocked(0)
 	m.gatewayPasswordSent = false
 	m.sawGatewayLogin = false
 	m.sawParseError = false
+	m.setStateLocked(StateDisconnected, "")
 	m.mu.Unlock()
 
-	m.setState(StateDisconnected, "")
 	m.addLog("=== VPN disconnected ===")
 	return nil
 }
@@ -307,7 +535,10 @@ func (m *Manager) runConnectLoop(req ConnectRequest) error {
 		m.mu.Lock()
 		m.otpSecret = req.OTPSecret
 		m.autoReconnect = req.AutoReconnect
-		m.reconnectAttempt = attempt
+		m.setReconnectAttemptLocked(attempt)
+		if attempt > 0 {
+			m.emitReconnectLocked("started", fmt.Sprintf("Starting reconnect attempt %d", attempt))
+		}
 		m.mu.Unlock()
 
 		if attempt > 0 {
@@ -318,9 +549,19 @@ func (m *Manager) runConnectLoop(req ConnectRequest) error {
 			return nil
 		}
 		if !req.AutoReconnect || !isReconnectableError(err) {
+			if attempt > 0 {
+				m.mu.Lock()
+				m.emitReconnectLocked("cancelled", fmt.Sprintf("Auto reconnect stopped after attempt %d: %v", attempt, err))
+				m.mu.Unlock()
+			}
 			return err
 		}
 		if m.isStopped() {
+			if attempt > 0 {
+				m.mu.Lock()
+				m.emitReconnectLocked("cancelled", "Auto reconnect cancelled by disconnect request")
+				m.mu.Unlock()
+			}
 			m.addLog("Auto reconnect: cancelled by disconnect request")
 			return nil
 		}
@@ -330,12 +571,16 @@ func (m *Manager) runConnectLoop(req ConnectRequest) error {
 		m.mu.Lock()
 		m.otpSecret = req.OTPSecret
 		m.autoReconnect = req.AutoReconnect
-		m.reconnectAttempt = attempt
+		m.setReconnectAttemptLocked(attempt)
+		m.emitReconnectLocked("scheduled", fmt.Sprintf("VPN stopped; reconnecting in %s (attempt %d)", delay.Round(time.Second), attempt))
 		m.mu.Unlock()
 		m.addLog(fmt.Sprintf("Auto reconnect: VPN stopped after being connected; retrying in %s (attempt %d)", delay.Round(time.Second), attempt))
 		m.setState(StateConnecting, "")
 		m.setPhase("reconnect-wait", fmt.Sprintf("VPN stopped; reconnecting in %s", delay.Round(time.Second)))
 		if !m.waitBeforeReconnect(delay) {
+			m.mu.Lock()
+			m.emitReconnectLocked("cancelled", "Auto reconnect cancelled by disconnect request")
+			m.mu.Unlock()
 			return nil
 		}
 	}
@@ -351,6 +596,9 @@ func (m *Manager) submitGeneratedOTP(promptCount int, secret string, stdin io.Wr
 	if wait > 0 {
 		m.addLog(fmt.Sprintf("MFA: waiting %s for next OTP window before response #%d", wait.Round(time.Second), promptCount))
 		m.setPhase("mfa-auto-wait", fmt.Sprintf("Waiting for next OTP window before response #%d", promptCount))
+		m.mu.Lock()
+		m.emitOTPLocked("wait", fmt.Sprintf("Waiting for next OTP window before response #%d", promptCount))
+		m.mu.Unlock()
 		if !m.waitForActiveAuth(wait, stdin) {
 			return
 		}
@@ -374,10 +622,10 @@ func (m *Manager) submitGeneratedOTP(promptCount int, secret string, stdin io.Wr
 		m.autoOTPInFlight = false
 		m.authResponsesSent++
 		if m.authResponsesSent >= m.otpPromptCount {
-			m.awaitingOTP = false
+			m.setAwaitingOTPLocked(false)
 		}
-		m.phase = "mfa-auto"
-		m.detail = fmt.Sprintf("Submitted generated OTP response #%d; waiting for server", promptCount)
+		m.setPhaseLocked("mfa-auto", fmt.Sprintf("Submitted generated OTP response #%d; waiting for server", promptCount))
+		m.emitOTPLocked("submit", fmt.Sprintf("Submitted generated OTP response #%d", promptCount))
 	}
 	m.mu.Unlock()
 	m.addLog(fmt.Sprintf("MFA: submitted generated OTP response #%d", promptCount))
@@ -387,9 +635,9 @@ func (m *Manager) failGeneratedOTP(promptCount int, stdin io.WriteCloser, err er
 	m.mu.Lock()
 	if m.stdin == stdin && m.state == StateConnecting {
 		m.autoOTPInFlight = false
-		m.awaitingOTP = true
-		m.phase = "mfa"
-		m.detail = fmt.Sprintf("Automatic OTP failed; enter OTP response #%d manually", promptCount)
+		m.setAwaitingOTPLocked(true)
+		m.setPhaseLocked("mfa", fmt.Sprintf("Automatic OTP failed; enter OTP response #%d manually", promptCount))
+		m.emitOTPLocked("fallback", fmt.Sprintf("Automatic OTP failed; enter OTP response #%d manually: %v", promptCount, err))
 	}
 	m.mu.Unlock()
 	m.addLog(fmt.Sprintf("MFA: automatic OTP failed: %v", err))
@@ -513,7 +761,7 @@ func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
 	m.mu.Lock()
 	m.cmd = cmd
 	m.stdin = stdinPipe
-	m.awaitingOTP = false
+	m.setAwaitingOTPLocked(false)
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
 	m.credentialPrompts = 0
@@ -524,10 +772,11 @@ func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
 	m.gatewayPasswordSent = false
 	m.sawGatewayLogin = false
 	m.sawParseError = false
+	hasOTPSecret := m.otpSecret != ""
 	m.mu.Unlock()
 
 	switch {
-	case m.otpSecret != "":
+	case hasOTPSecret:
 		m.setPhase("auth", "Submitting saved password; OTP will be generated when requested")
 	case len(inputLines) > 1:
 		m.setPhase("auth", "Submitting saved password and initial OTP")
@@ -600,16 +849,10 @@ func (m *Manager) streamOutput(r io.Reader) {
 		switch {
 		case isVPNEstablishedLine(lower):
 			iface := detectTunInterface()
-			m.mu.Lock()
-			m.state = StateConnected
-			m.connectedAt = time.Now()
-			m.tunInterface = iface
-			m.awaitingOTP = false
-			m.phase = "connected"
-			m.detail = "VPN tunnel established"
+			m.markConnected(iface)
+			m.mu.RLock()
 			reconnectAttempt := m.reconnectAttempt
-			cb := m.onStateChange
-			m.mu.Unlock()
+			m.mu.RUnlock()
 			if reconnectAttempt > 0 {
 				m.addLog(fmt.Sprintf("Auto reconnect: attempt %d established the VPN tunnel", reconnectAttempt))
 			}
@@ -617,9 +860,6 @@ func (m *Manager) streamOutput(r io.Reader) {
 				m.addLog(fmt.Sprintf("Tunnel up on interface: %s", iface))
 			} else {
 				m.addLog("Tunnel established; interface not detected yet")
-			}
-			if cb != nil {
-				cb(StateConnected)
 			}
 		case containsAny(lower, "disconnected", "connection terminated", "bye"):
 			m.mu.RLock()
@@ -646,6 +886,9 @@ func (m *Manager) writeInitialAuth(stdin io.Writer, lines []string) error {
 		m.recordAuthResponse()
 	}
 	if len(lines) > 1 {
+		m.mu.Lock()
+		m.emitOTPLocked("submit", fmt.Sprintf("Submitted %d initial OTP response(s)", len(lines)-1))
+		m.mu.Unlock()
 		m.addLog(fmt.Sprintf("MFA: submitted %d initial OTP response(s)", len(lines)-1))
 	}
 	return nil
@@ -685,17 +928,15 @@ func (m *Manager) updatePhaseFromLine(lower string) {
 func (m *Manager) markGatewayLoginAttempt() {
 	m.mu.Lock()
 	m.sawGatewayLogin = true
-	m.phase = "gateway-login"
-	m.detail = "Submitting authentication to gateway"
+	m.setPhaseLocked("gateway-login", "Submitting authentication to gateway")
 	m.mu.Unlock()
 }
 
 func (m *Manager) markParseError() {
 	m.mu.Lock()
 	m.sawParseError = true
-	m.phase = "auth-parse-error"
-	m.detail = "Gateway returned an authentication response openconnect could not parse"
-	m.awaitingOTP = false
+	m.setPhaseLocked("auth-parse-error", "Gateway returned an authentication response openconnect could not parse")
+	m.setAwaitingOTPLocked(false)
 	m.mu.Unlock()
 }
 
@@ -710,8 +951,7 @@ func (m *Manager) noteCredentialPrompt() {
 	m.credentialPrompts++
 	count := m.credentialPrompts
 	if count == 1 {
-		m.phase = "portal-auth"
-		m.detail = "Submitting portal credentials"
+		m.setPhaseLocked("portal-auth", "Submitting portal credentials")
 		m.mu.Unlock()
 		return
 	}
@@ -721,20 +961,20 @@ func (m *Manager) noteCredentialPrompt() {
 	shouldSendGatewayPassword := !m.gatewayPasswordSent && password != "" && stdin != nil
 	if shouldSendGatewayPassword {
 		m.gatewayPasswordSent = true
-		m.awaitingOTP = false
-		m.phase = "gateway-auth"
-		m.detail = "Gateway requested password; submitting saved password"
+		m.setAwaitingOTPLocked(false)
+		m.setPhaseLocked("gateway-auth", "Gateway requested password; submitting saved password")
 	} else {
-		m.awaitingOTP = false
-		m.phase = "gateway-auth"
+		m.setAwaitingOTPLocked(false)
+		detail := ""
 		switch {
 		case password == "":
-			m.detail = "Gateway requested credentials, but no saved password is configured"
+			detail = "Gateway requested credentials, but no saved password is configured"
 		case m.gatewayPasswordSent:
-			m.detail = "Gateway requested credentials again; waiting for an explicit OTP/password prompt"
+			detail = "Gateway requested credentials again; waiting for an explicit OTP/password prompt"
 		default:
-			m.detail = "Gateway requested credentials; waiting for an explicit prompt"
+			detail = "Gateway requested credentials; waiting for an explicit prompt"
 		}
+		m.setPhaseLocked("gateway-auth", detail)
 	}
 	m.mu.Unlock()
 
@@ -753,7 +993,7 @@ func (m *Manager) recordAuthResponse() {
 	m.mu.Lock()
 	m.authResponsesSent++
 	if m.authResponsesSent >= m.otpPromptCount {
-		m.awaitingOTP = false
+		m.setAwaitingOTPLocked(false)
 	}
 	m.mu.Unlock()
 }
@@ -769,12 +1009,11 @@ func (m *Manager) noteOTPPrompt() {
 
 	m.mu.Lock()
 	if m.awaitingOTP || m.autoOTPInFlight {
-		m.phase = "mfa"
+		detail := fmt.Sprintf("Waiting for fresh OTP response #%d", m.otpPromptCount)
 		if m.autoOTPInFlight {
-			m.detail = fmt.Sprintf("Generating OTP response #%d", m.otpPromptCount)
-		} else {
-			m.detail = fmt.Sprintf("Waiting for fresh OTP response #%d", m.otpPromptCount)
+			detail = fmt.Sprintf("Generating OTP response #%d", m.otpPromptCount)
 		}
+		m.setPhaseLocked("mfa", detail)
 		m.mu.Unlock()
 		return
 	}
@@ -786,18 +1025,19 @@ func (m *Manager) noteOTPPrompt() {
 		stdin = m.stdin
 		afterStep = m.lastAutoOTPStep
 		if autoSecret != "" && stdin != nil {
-			m.awaitingOTP = false
+			m.setAwaitingOTPLocked(false)
 			m.autoOTPInFlight = true
-			m.phase = "mfa-auto"
-			m.detail = fmt.Sprintf("Generating OTP response #%d", promptCount)
+			m.setPhaseLocked("mfa-auto", fmt.Sprintf("Generating OTP response #%d", promptCount))
+			m.emitOTPLocked("prompt", fmt.Sprintf("Automatic OTP prompt #%d", promptCount))
+			m.emitOTPLocked("generate", fmt.Sprintf("Generating OTP response #%d", promptCount))
 		} else {
-			m.awaitingOTP = true
-			m.phase = "mfa"
-			m.detail = fmt.Sprintf("Waiting for fresh OTP response #%d", promptCount)
+			m.setAwaitingOTPLocked(true)
+			m.setPhaseLocked("mfa", fmt.Sprintf("Waiting for fresh OTP response #%d", promptCount))
+			m.emitOTPLocked("prompt", fmt.Sprintf("Manual OTP prompt #%d", promptCount))
 		}
 	} else {
-		m.phase = "mfa"
-		m.detail = fmt.Sprintf("Submitted OTP response #%d; waiting for server", promptCount)
+		m.setPhaseLocked("mfa", fmt.Sprintf("Submitted OTP response #%d; waiting for server", promptCount))
+		m.emitOTPLocked("prompt", fmt.Sprintf("OTP prompt #%d already has a response", promptCount))
 	}
 	m.mu.Unlock()
 
@@ -815,7 +1055,7 @@ func (m *Manager) clearProcessAuthState() {
 	m.mu.Lock()
 	m.cmd = nil
 	m.stdin = nil
-	m.awaitingOTP = false
+	m.setAwaitingOTPLocked(false)
 	m.otpPromptCount = 0
 	m.authResponsesSent = 0
 	m.credentialPrompts = 0
@@ -825,35 +1065,6 @@ func (m *Manager) clearProcessAuthState() {
 	m.autoReconnect = false
 	m.gatewayPasswordSent = false
 	m.mu.Unlock()
-}
-
-func (m *Manager) setPhase(phase, detail string) {
-	m.mu.Lock()
-	m.phase = phase
-	m.detail = detail
-	m.mu.Unlock()
-}
-
-// setState safely updates state and fires the callback
-func (m *Manager) setState(s State, errMsg string) {
-	m.mu.Lock()
-	m.state = s
-	m.errorMsg = errMsg
-	if s == StateDisconnected {
-		m.phase = ""
-		m.detail = ""
-		m.awaitingOTP = false
-	}
-	if s == StateError && errMsg != "" {
-		m.phase = "error"
-		m.detail = errMsg
-		m.awaitingOTP = false
-	}
-	cb := m.onStateChange
-	m.mu.Unlock()
-	if cb != nil {
-		cb(s)
-	}
 }
 
 // addLog appends a timestamped log line (capped at 500 lines)

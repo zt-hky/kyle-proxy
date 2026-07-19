@@ -8,24 +8,20 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
-	"kyle-proxy/internal/auth"
-	"kyle-proxy/internal/config"
-	"kyle-proxy/internal/proxy"
-	"kyle-proxy/internal/users"
-	"kyle-proxy/internal/vpn"
+	"globalprotect-manager/internal/auth"
+	"globalprotect-manager/internal/config"
+	"globalprotect-manager/internal/control"
 )
 
 // NewRouter builds and returns the HTTP router.
 // staticFS is the embedded Svelte build output; pass nil for dev mode.
 func NewRouter(
-	v *vpn.Manager,
-	p *proxy.Manager,
+	controller *control.VPN,
 	c *config.Manager,
-	us *users.Store,
 	ga *auth.GitHubAuth,
 	staticFS fs.FS,
 ) http.Handler {
-	h := newHandler(v, p, c, us, ga)
+	h := newHandler(controller, c, ga)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -52,27 +48,8 @@ func NewRouter(
 	r.Post("/api/vpn/disconnect", h.handleDisconnect)
 
 	r.Get("/api/logs", h.handleLogs)
-	r.Get("/api/proxy/info", h.handleProxyInfo)
 
 	r.Post("/api/certs/upload", h.handleCertUpload)
-
-	// ── User management API ──────────────────────────────────────────────────
-	r.Get("/api/users", h.handleListUsers)
-	r.Post("/api/users", h.handleCreateUser)
-	r.Put("/api/users/{id}", h.handleUpdateUser)
-	r.Delete("/api/users/{id}", h.handleDeleteUser)
-	r.Get("/api/users/{id}/vmess", h.handleVMessExport)
-	r.Get("/api/users/{id}/v2ray-config", h.handleV2RayClientConfig) // full client config with routing
-
-	// ── Group management API ──────────────────────────────────────────────────
-	r.Get("/api/groups", h.handleListGroups)
-	r.Post("/api/groups", h.handleCreateGroup)
-	r.Put("/api/groups/{id}", h.handleUpdateGroup)
-	r.Delete("/api/groups/{id}", h.handleDeleteGroup)
-
-	// ── PAC files (public — no auth required) ────────────────────────────────
-	r.Get("/pac", h.handlePAC)
-	r.Get("/pac/{username}", h.handleUserPAC)
 
 	// ── Static SPA ───────────────────────────────────────────────────────────
 	if staticFS != nil {
@@ -84,6 +61,10 @@ func NewRouter(
 			}
 			f, err := staticFS.Open(path)
 			if err != nil {
+				if strings.HasPrefix(path, "api/") || path == "pac" || strings.HasPrefix(path, "pac/") {
+					http.NotFound(w, r)
+					return
+				}
 				r.URL.Path = "/index.html"
 			} else {
 				f.Close()

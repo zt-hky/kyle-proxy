@@ -121,7 +121,7 @@ func randHex(n int) string {
 }
 
 // Middleware protects all routes requiring authentication.
-// Public paths: /auth/*, /api/health, /pac, /pac/*
+// Public paths: /auth/* and /api/health.
 // If auth is disabled (Enabled = false), this is a no-op.
 func (ga *GitHubAuth) Middleware(next http.Handler) http.Handler {
 	if !ga.Enabled {
@@ -133,9 +133,7 @@ func (ga *GitHubAuth) Middleware(next http.Handler) http.Handler {
 		case path == "/auth/login",
 			path == "/auth/callback",
 			path == "/auth/logout",
-			path == "/api/health",
-			path == "/pac",
-			strings.HasPrefix(path, "/pac/"):
+			path == "/api/health":
 			next.ServeHTTP(w, r)
 			return
 		}

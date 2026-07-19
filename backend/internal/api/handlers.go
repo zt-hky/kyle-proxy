@@ -3,31 +3,27 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
-	"kyle-proxy/internal/auth"
-	"kyle-proxy/internal/config"
-	"kyle-proxy/internal/proxy"
-	"kyle-proxy/internal/users"
-	"kyle-proxy/internal/vpn"
+	"globalprotect-manager/internal/auth"
+	"globalprotect-manager/internal/config"
+	"globalprotect-manager/internal/control"
+	"globalprotect-manager/internal/vpn"
 )
 
 // Handler holds all dependencies for HTTP handlers
 type Handler struct {
-	vpnMgr     *vpn.Manager
-	proxyMgr   *proxy.Manager
+	controller *control.VPN
 	cfgMgr     *config.Manager
-	userStore  *users.Store
 	githubAuth *auth.GitHubAuth
 }
 
-func newHandler(v *vpn.Manager, p *proxy.Manager, c *config.Manager, us *users.Store, ga *auth.GitHubAuth) *Handler {
-	return &Handler{vpnMgr: v, proxyMgr: p, cfgMgr: c, userStore: us, githubAuth: ga}
+func newHandler(cn *control.VPN, c *config.Manager, ga *auth.GitHubAuth) *Handler {
+	return &Handler{controller: cn, cfgMgr: c, githubAuth: ga}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -49,15 +45,11 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 type statusResponse struct {
-	VPN   vpn.Status     `json:"vpn"`
-	Proxy proxyStatusExt `json:"proxy"`
+	VPN vpn.Status `json:"vpn"`
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, statusResponse{
-		VPN:   h.vpnMgr.GetStatus(),
-		Proxy: toStatusExt(h.proxyMgr.GetStatus(), h.proxyMgr.GetVMessPort()),
-	})
+	writeJSON(w, http.StatusOK, statusResponse{VPN: h.controller.Status()})
 }
 
 type configResponse struct {
@@ -70,10 +62,6 @@ type configResponse struct {
 	CertFile      string   `json:"cert_file"`
 	TrustCert     bool     `json:"trust_cert"`
 	ExtraArgs     []string `json:"extra_args"`
-	HTTPPort      int      `json:"http_port"`
-	Socks5Port    int      `json:"socks5_port"`
-	VMessPort     int      `json:"vmess_port"`
-	ServerHost    string   `json:"server_host"`
 }
 
 func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
@@ -82,9 +70,7 @@ func (h *Handler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
 		HasPass: cfg.VPN.Password != "", HasOTPSecret: cfg.VPN.OTPSecret != "",
 		AutoReconnect: cfg.VPN.AutoReconnect && cfg.VPN.OTPSecret != "",
-		CertFile:      cfg.VPN.CertFile, TrustCert: cfg.VPN.TrustCert,
-		ExtraArgs: cfg.VPN.ExtraArgs, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
-		VMessPort: cfg.Proxy.VMessPort, ServerHost: cfg.Proxy.ServerHost,
+		CertFile:      cfg.VPN.CertFile, TrustCert: cfg.VPN.TrustCert, ExtraArgs: cfg.VPN.ExtraArgs,
 	})
 }
 
@@ -99,10 +85,6 @@ type updateConfigRequest struct {
 	CertFile       string   `json:"cert_file"`
 	TrustCert      bool     `json:"trust_cert"`
 	ExtraArgs      []string `json:"extra_args"`
-	HTTPPort       int      `json:"http_port"`
-	Socks5Port     int      `json:"socks5_port"`
-	VMessPort      int      `json:"vmess_port"`
-	ServerHost     string   `json:"server_host"`
 }
 
 func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -112,11 +94,8 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := h.cfgMgr.Get()
-	cfg.VPN.Portal = req.Portal
-	cfg.VPN.Gateway = req.Gateway
-	cfg.VPN.Username = req.Username
-	cfg.VPN.CertFile = req.CertFile
-	cfg.VPN.TrustCert = req.TrustCert
+	cfg.VPN.Portal, cfg.VPN.Gateway, cfg.VPN.Username = req.Portal, req.Gateway, req.Username
+	cfg.VPN.CertFile, cfg.VPN.TrustCert = req.CertFile, req.TrustCert
 	if req.ExtraArgs != nil {
 		cfg.VPN.ExtraArgs = req.ExtraArgs
 	}
@@ -133,26 +112,9 @@ func (h *Handler) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.VPN.OTPSecret = secret
 	}
 	cfg.VPN.AutoReconnect = req.AutoReconnect && cfg.VPN.OTPSecret != ""
-	if req.HTTPPort > 0 {
-		cfg.Proxy.HTTPPort = req.HTTPPort
-	}
-	if req.Socks5Port > 0 {
-		cfg.Proxy.Socks5Port = req.Socks5Port
-	}
-	if req.VMessPort > 0 {
-		cfg.Proxy.VMessPort = req.VMessPort
-	}
-	cfg.Proxy.ServerHost = req.ServerHost // allow setting or clearing
 	if err := h.cfgMgr.Save(cfg); err != nil {
 		writeError(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return
-	}
-	if req.HTTPPort > 0 || req.Socks5Port > 0 || req.VMessPort > 0 {
-		go func() {
-			_ = h.proxyMgr.UpdateConfig(proxy.Config{
-				HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port, VMessPort: cfg.Proxy.VMessPort,
-			})
-		}()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
@@ -166,27 +128,12 @@ type connectRequest struct {
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	var req connectRequest
 	_ = readJSON(r, &req)
-	cfg := h.cfgMgr.Get()
-	if cfg.VPN.Portal == "" || cfg.VPN.Username == "" {
-		writeError(w, http.StatusBadRequest, "VPN portal and username must be configured first")
-		return
-	}
-	autoReconnect := cfg.VPN.AutoReconnect
-	if req.AutoReconnect != nil {
-		autoReconnect = *req.AutoReconnect
-	}
-	if autoReconnect && cfg.VPN.OTPSecret == "" {
-		writeError(w, http.StatusBadRequest, "auto reconnect requires a saved OTP secret")
-		return
-	}
-	if err := h.vpnMgr.Connect(vpn.ConnectRequest{
-		Portal: cfg.VPN.Portal, Gateway: cfg.VPN.Gateway, Username: cfg.VPN.Username,
-		Password: cfg.VPN.Password, OTP: req.OTP, OTP2: req.OTP2,
-		OTPSecret: cfg.VPN.OTPSecret, AutoReconnect: autoReconnect && cfg.VPN.OTPSecret != "",
-		CertFile:  cfg.VPN.CertFile,
-		TrustCert: cfg.VPN.TrustCert, ExtraArgs: cfg.VPN.ExtraArgs,
-	}); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
+	if err := h.controller.Connect(control.ConnectOptions{OTP: req.OTP, OTP2: req.OTP2, AutoReconnect: req.AutoReconnect}); err != nil {
+		if strings.Contains(err.Error(), "configured first") || strings.Contains(err.Error(), "saved OTP") {
+			writeError(w, http.StatusBadRequest, err.Error())
+		} else {
+			writeError(w, http.StatusConflict, err.Error())
+		}
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "connecting"})
@@ -202,7 +149,7 @@ func (h *Handler) handleVPNOTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	if err := h.vpnMgr.SubmitOTP(req.OTP); err != nil {
+	if err := h.controller.SubmitOTP(req.OTP); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
@@ -210,7 +157,7 @@ func (h *Handler) handleVPNOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDisconnect(w http.ResponseWriter, _ *http.Request) {
-	if err := h.vpnMgr.Disconnect(); err != nil {
+	if err := h.controller.Disconnect(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -218,47 +165,7 @@ func (h *Handler) handleDisconnect(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) handleLogs(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string][]string{"lines": h.vpnMgr.GetLogs()})
-}
-
-func (h *Handler) handleProxyInfo(w http.ResponseWriter, r *http.Request) {
-	cfg := h.cfgMgr.Get()
-	host := getOutboundIP()
-	if rh, _, err := net.SplitHostPort(r.Host); err == nil && rh != "" {
-		host = rh
-	}
-	if sh := cfg.Proxy.ServerHost; sh != "" {
-		host = sh // user-configured public host takes priority
-	}
-	vMessPort := h.proxyMgr.GetVMessPort()
-	hasUsers := len(h.userStore.ListUsers()) > 0
-	writeJSON(w, http.StatusOK, proxyInfoExtended{
-		HostIP: host, HTTPPort: cfg.Proxy.HTTPPort, Socks5Port: cfg.Proxy.Socks5Port,
-		VMessPort: vMessPort,
-		HTTPProxy: fmt.Sprintf("http://%s:%d", host, cfg.Proxy.HTTPPort),
-		Socks5:    fmt.Sprintf("socks5://%s:%d", host, cfg.Proxy.Socks5Port),
-		PACUrl:    fmt.Sprintf("http://%s:8888/pac", host),
-		AuthMode:  hasUsers,
-	})
-}
-
-// GET /pac — Proxy Auto-Config for iPhone:
-// Settings → Wi-Fi → ⓘ → Configure Proxy → Auto → URL: http://\<host\>:8888/pac
-func (h *Handler) handlePAC(w http.ResponseWriter, _ *http.Request) {
-	cfg := h.cfgMgr.Get()
-	host := getOutboundIP()
-	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
-    if (isInNet(dnsResolve(host),"10.0.0.0","255.0.0.0") ||
-        isInNet(dnsResolve(host),"172.16.0.0","255.240.0.0") ||
-        isInNet(dnsResolve(host),"192.168.0.0","255.255.0.0") ||
-        isInNet(dnsResolve(host),"127.0.0.0","255.0.0.0") ||
-        isPlainHostName(host)) { return "DIRECT"; }
-    return "PROXY %s:%d";
-}
-`, host, cfg.Proxy.HTTPPort)
-	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(pac))
+	writeJSON(w, http.StatusOK, map[string][]string{"lines": h.controller.Logs()})
 }
 
 func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +208,7 @@ func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
 	cfg.VPN.CertFile = certPath
 	_ = h.cfgMgr.Save(cfg)
 	installCmd := exec.Command("sh", "-c",
-		fmt.Sprintf("cp %s /usr/local/share/ca-certificates/kyle-proxy-ca.crt && update-ca-certificates", certPath))
+		fmt.Sprintf("cp %s /usr/local/share/ca-certificates/globalprotect-manager-ca.crt && update-ca-certificates", certPath))
 	if outBytes, err := installCmd.CombinedOutput(); err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "uploaded", "path": certPath,
@@ -310,13 +217,4 @@ func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "uploaded", "path": certPath})
-}
-
-func getOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
