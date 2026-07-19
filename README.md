@@ -17,6 +17,13 @@ docker compose up -d --build
 Open `http://<host>:8888`.
 
 The container requires `/dev/net/tun`, `NET_ADMIN`, and `SYS_PTRACE`. Persistent configuration and certificates are stored in the `globalprotect-manager-data` volume.
+## Deployment documentation
+
+- [Docker and Docker Compose deployment](docs/deployment.md)
+- [Telegram bot setup, owner initialization, and access approval](docs/telegram.md)
+- Copy [`.env.example`](.env.example) to `.env` before enabling Telegram or GitHub OAuth.
+
+The deployment guide covers first GlobalProtect profile configuration, persistent-volume backup/restore, migration, health checks, and troubleshooting.
 
 ## Telegram
 
