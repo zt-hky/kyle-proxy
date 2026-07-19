@@ -23,7 +23,45 @@ import (
 //go:embed static
 var embeddedStatic embed.FS
 
+type telegramConfig struct {
+	token   string
+	ownerID int64
+	enabled bool
+	reason  string
+}
+
+func telegramConfigFromEnv() telegramConfig {
+	token, ownerText := os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_OWNER_ID")
+	if token == "" && ownerText == "" {
+		return telegramConfig{reason: "Telegram bot disabled"}
+	}
+	if token == "" || ownerText == "" {
+		return telegramConfig{reason: "Telegram bot disabled: token and owner ID are both required"}
+	}
+	ownerID, err := strconv.ParseInt(ownerText, 10, 64)
+	if err != nil || ownerID <= 0 {
+		return telegramConfig{reason: "Telegram bot disabled: invalid owner ID"}
+	}
+	return telegramConfig{token: token, ownerID: ownerID, enabled: true}
+}
+
+type telegramService interface {
+	Start(context.Context)
+	BeginShutdown()
+	Flush(context.Context) error
+}
+
+var newTelegramService = func(token string, ownerID int64, accessPath string, controller *control.VPN) (telegramService, error) {
+	return telegram.New(token, ownerID, accessPath, controller)
+}
+
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	run(ctx)
+}
+
+func run(ctx context.Context) {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("GlobalProtect Manager starting")
 	cfgMgr := config.NewManager(envOr("CONFIG_PATH", "/data/config.json"))
@@ -37,16 +75,13 @@ func main() {
 		log.Println("GitHub auth not configured — management UI is unprotected")
 	}
 
-	var botSvc *telegram.Service
-	token, ownerText := os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_OWNER_ID")
-	if token == "" && ownerText == "" {
-		log.Println("Telegram bot disabled")
-	} else if token == "" || ownerText == "" {
-		log.Println("Telegram bot disabled: token and owner ID are both required")
-	} else if ownerID, err := strconv.ParseInt(ownerText, 10, 64); err != nil || ownerID <= 0 {
-		log.Printf("Telegram bot disabled: invalid owner ID")
+	var botSvc telegramService
+	botCfg := telegramConfigFromEnv()
+	if !botCfg.enabled {
+		log.Println(botCfg.reason)
 	} else {
-		botSvc, err = telegram.New(token, ownerID, envOr("TELEGRAM_ACCESS_PATH", "/data/telegram-access.json"), controller)
+		var err error
+		botSvc, err = newTelegramService(botCfg.token, botCfg.ownerID, envOr("TELEGRAM_ACCESS_PATH", "/data/telegram-access.json"), controller)
 		if err != nil {
 			log.Printf("Telegram bot disabled: %v", err)
 		}
@@ -72,8 +107,6 @@ func main() {
 			log.Printf("HTTP server error: %v", err)
 		}
 	}()
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	<-ctx.Done()
 	log.Println("Shutting down")
 	if botSvc != nil {

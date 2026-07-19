@@ -58,7 +58,7 @@ func boolPointer(value bool) *bool { return &value }
 
 func TestConnectRequiresConfiguredPortalAndUsername(t *testing.T) {
 	tests := []struct {
-		name      string
+		name     string
 		portal   string
 		username string
 	}{
@@ -88,10 +88,10 @@ func TestConnectRequiresConfiguredPortalAndUsername(t *testing.T) {
 
 func TestConnectUsesPersistedAutoReconnectUnlessOverridden(t *testing.T) {
 	tests := []struct {
-		name             string
-		persisted        bool
-		override         *bool
-		otpSecret        string
+		name              string
+		persisted         bool
+		override          *bool
+		otpSecret         string
 		wantAutoReconnect bool
 	}{
 		{
@@ -146,19 +146,19 @@ func TestConnectUsesPersistedAutoReconnectUnlessOverridden(t *testing.T) {
 
 func TestConnectRequiresSavedTOTPWhenAutoReconnectEnabled(t *testing.T) {
 	tests := []struct {
-		name       string
+		name      string
 		persisted bool
-		override   *bool
+		override  *bool
 		otpSecret string
 	}{
 		{
-			name:       "persisted auto reconnect",
+			name:      "persisted auto reconnect",
 			persisted: true,
 			otpSecret: "",
 		},
 		{
-			name:       "override enables auto reconnect",
-			override:   boolPointer(true),
+			name:      "override enables auto reconnect",
+			override:  boolPointer(true),
 			otpSecret: " \t\n",
 		},
 	}
@@ -327,5 +327,25 @@ func TestControllerDelegatesManagerOperations(t *testing.T) {
 	manager.onEvent(wantEvent)
 	if !reflect.DeepEqual(received, wantEvent) {
 		t.Fatal("OnEvent callback did not receive the manager event unchanged")
+	}
+}
+
+func TestHasSavedOTPTrimsWhitespace(t *testing.T) {
+	tests := []struct {
+		name   string
+		secret string
+		want   bool
+	}{
+		{name: "missing"},
+		{name: "whitespace", secret: " \t\n"},
+		{name: "saved", secret: " saved-test-value ", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			controller, _, _ := newTestController(t, config.VPNConfig{OTPSecret: tt.secret})
+			if got := controller.HasSavedOTP(); got != tt.want {
+				t.Fatalf("HasSavedOTP() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

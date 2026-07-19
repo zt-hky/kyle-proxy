@@ -32,15 +32,18 @@ type recordedDelete struct {
 }
 
 type fakeTelegramClient struct {
-	mu          sync.Mutex
-	nextID      int
-	sends       []recordedSend
-	deletes     []recordedDelete
-	answers     []string
-	answerCh    chan string
-	sendHook    func(recordedSend)
-	failChat    map[int64]error
-	deleteError error
+	mu            sync.Mutex
+	nextID        int
+	sends         []recordedSend
+	deletes       []recordedDelete
+	answers       []string
+	answerCh      chan string
+	sendHook      func(recordedSend)
+	failChat      map[int64]error
+	deleteError   error
+	webhookError  error
+	commandsError error
+	started       chan struct{}
 }
 
 func newFakeTelegramClient() *fakeTelegramClient {
@@ -48,15 +51,16 @@ func newFakeTelegramClient() *fakeTelegramClient {
 		nextID:   1000,
 		answerCh: make(chan string, 32),
 		failChat: make(map[int64]error),
+		started:  make(chan struct{}, 1),
 	}
 }
 
 func (f *fakeTelegramClient) DeleteWebhook(context.Context, *bot.DeleteWebhookParams) (bool, error) {
-	return true, nil
+	return f.webhookError == nil, f.webhookError
 }
 
 func (f *fakeTelegramClient) SetMyCommands(context.Context, *bot.SetMyCommandsParams) (bool, error) {
-	return true, nil
+	return f.commandsError == nil, f.commandsError
 }
 
 func numericChatID(chatID any) int64 {
@@ -101,7 +105,10 @@ func (f *fakeTelegramClient) AnswerCallbackQuery(_ context.Context, params *bot.
 	return true, nil
 }
 
-func (f *fakeTelegramClient) Start(ctx context.Context) { <-ctx.Done() }
+func (f *fakeTelegramClient) Start(ctx context.Context) {
+	f.started <- struct{}{}
+	<-ctx.Done()
+}
 
 func (f *fakeTelegramClient) snapshotSends() []recordedSend {
 	f.mu.Lock()
@@ -134,20 +141,20 @@ func (f *fakeTelegramClient) setChatFailure(chatID int64, err error) {
 }
 
 type fakeVPNController struct {
-	mu                 sync.Mutex
-	status             vpn.Status
-	savedOTP           bool
-	connectCount       int
-	connectUsedOTP     []bool
-	submitCount        int
-	submitUsedOTP      []bool
-	disconnectCount    int
-	connectError       error
-	submitError        error
-	disconnectError    error
-	connectHook        func()
-	submitHook         func()
-	eventHandler       func(vpn.Event)
+	mu              sync.Mutex
+	status          vpn.Status
+	savedOTP        bool
+	connectCount    int
+	connectUsedOTP  []bool
+	submitCount     int
+	submitUsedOTP   []bool
+	disconnectCount int
+	connectError    error
+	submitError     error
+	disconnectError error
+	connectHook     func()
+	submitHook      func()
+	eventHandler    func(vpn.Event)
 }
 
 func (f *fakeVPNController) Connect(options control.ConnectOptions) error {
@@ -591,7 +598,6 @@ func TestOTPReplyMustMatchPromptExpiresAndIsClaimedOnce(t *testing.T) {
 		t.Fatalf("expired follow-up OTP made %d deletion attempts, want 2", got-beforeFollowupDeletes)
 	}
 
-
 	controller.setStatus(vpn.Status{State: vpn.StateDisconnected})
 	service.connect(context.Background(), nil, privateMessage(200, "/connect", 6, 0))
 	service.mu.Lock()
@@ -857,4 +863,197 @@ func TestEventFIFOUsesDequeueRecipientSnapshotAndContinuesAfterSendFailure(t *te
 	}
 	close(thirdRelease)
 	waitForSendCount(t, client, 7)
+}
+
+func TestStartSetupFailuresAndSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		webhook  error
+		commands error
+		starts   bool
+	}{
+		{name: "webhook failure", webhook: errors.New("webhook")},
+		{name: "command failure", commands: errors.New("commands")},
+		{name: "success", starts: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, _, _, client := newServiceHarness(t)
+			client.webhookError = tc.webhook
+			client.commandsError = tc.commands
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() {
+				service.Start(ctx)
+				close(done)
+			}()
+			if tc.starts {
+				select {
+				case <-client.started:
+				case <-time.After(time.Second):
+					t.Fatal("bot did not start")
+				}
+				cancel()
+			} else {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("setup failure did not return")
+				}
+				cancel()
+			}
+			<-done
+		})
+	}
+}
+
+func TestCommandsMenusAndControllerFailures(t *testing.T) {
+	service, store, controller, client := newServiceHarness(t)
+	ctx := context.Background()
+	mustUpsertAccess(t, store, 200, AccessApproved)
+
+	service.menu(ctx, nil, privateMessage(200, "/menu", 1, 0))
+	service.accessCommand(ctx, nil, privateMessage(200, "/access", 2, 0))
+	service.accessCommand(ctx, nil, privateMessage(testOwnerID, "/access", 3, 0))
+	controller.connectError = errors.New("connect broke")
+	service.connect(ctx, nil, privateMessage(200, "/connect", 4, 0))
+	controller.disconnectError = errors.New("disconnect broke")
+	service.disconnect(ctx, nil, privateMessage(200, "/disconnect", 5, 0))
+	controller.disconnectError = nil
+	service.callback(ctx, nil, privateCallback(200, "vpn:disconnect", "disconnect"))
+	service.callback(ctx, nil, privateCallback(200, "menu:main", "main"))
+
+	texts := make([]string, 0)
+	for _, send := range client.snapshotSends() {
+		texts = append(texts, send.text)
+	}
+	joined := strings.Join(texts, "\n")
+	for _, want := range []string{"Access records:", "Connect failed: connect broke", "Disconnect failed: disconnect broke"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("messages %q omit %q", joined, want)
+		}
+	}
+
+	for _, status := range []vpn.Status{
+		{State: vpn.StateDisconnected},
+		{State: vpn.StateError},
+		{State: vpn.StateConnecting},
+		{State: vpn.StateConnecting, AwaitingOTP: true},
+		{State: vpn.StateConnected},
+	} {
+		controller.setStatus(status)
+		service.sendMenu(ctx, testOwnerID)
+	}
+}
+
+func TestStartIdentityAndAccessCallbackValidation(t *testing.T) {
+	service, store, _, client := newServiceHarness(t)
+	ctx := context.Background()
+	service.start(ctx, nil, nil)
+	service.start(ctx, nil, messageUpdate(200, -1, models.ChatTypeGroup, "/start", 1, 0))
+	service.start(ctx, nil, privateMessage(testOwnerID, "/start", 2, 0))
+	mustUpsertAccess(t, store, 200, AccessApproved)
+	service.start(ctx, nil, privateMessage(200, "/start", 3, 0))
+	service.accessCallback(ctx, nil, nil)
+	service.accessCallback(ctx, nil, privateCallback(200, "access:deny:200", "not-owner"))
+	for i, data := range []string{
+		"access:approve",
+		"access:approve:nope",
+		"access:approve:100",
+		"access:approve:999",
+		"access:unknown:200",
+		"access:approve:200",
+		"access:revoke:999",
+	} {
+		service.accessCallback(ctx, nil, privateCallback(testOwnerID, data, fmt.Sprintf("validation-%d", i)))
+	}
+	if len(client.snapshotSends()) == 0 {
+		t.Fatal("owner and approved start should send menus")
+	}
+}
+
+func TestOTPPromptAndSubmissionErrors(t *testing.T) {
+	service, store, controller, client := newServiceHarness(t)
+	ctx := context.Background()
+	mustUpsertAccess(t, store, 200, AccessApproved)
+
+	controller.setStatus(vpn.Status{State: vpn.StateDisconnected})
+	service.otpPrompt(ctx, nil, privateMessage(200, "/otp", 1, 0))
+	service.otpPromptLocked(ctx, 200, 200)
+	client.setChatFailure(200, errors.New("send failed"))
+	controller.setStatus(vpn.Status{State: vpn.StateConnecting, AwaitingOTP: true})
+	service.otpPrompt(ctx, nil, privateMessage(200, "/otp", 2, 0))
+	client.setChatFailure(200, nil)
+	service.otpPrompt(ctx, nil, privateMessage(200, "/otp", 3, 0))
+	service.mu.Lock()
+	prompt := service.pending[200]
+	service.mu.Unlock()
+	controller.submitError = errors.New("submit broke")
+	service.text(ctx, nil, privateMessage(200, "123456", 4, prompt.PromptMessageID))
+
+	controller.setSavedOTP(false)
+	service.connect(ctx, nil, privateMessage(200, "/connect", 5, 0))
+	service.mu.Lock()
+	initial := service.pending[200]
+	service.mu.Unlock()
+	controller.connectError = errors.New("initial broke")
+	service.text(ctx, nil, privateMessage(200, "654321", 6, initial.PromptMessageID))
+
+	joined := ""
+	for _, send := range client.snapshotSends() {
+		joined += send.text + "\n"
+	}
+	if !strings.Contains(joined, "OTP failed: submit broke") || !strings.Contains(joined, "OTP failed: initial broke") {
+		t.Fatalf("OTP failures not reported: %q", joined)
+	}
+}
+
+func TestNotifyPromptInvalidationAndFlushWithoutDispatcher(t *testing.T) {
+	service, _, controller, _ := newServiceHarness(t)
+	service.mu.Lock()
+	service.pending[200] = pendingOTP{Kind: "followup"}
+	service.pending[300] = pendingOTP{Kind: "initial"}
+	service.mu.Unlock()
+	controller.emit(vpn.Event{Kind: vpn.EventKindState, Status: vpn.Status{AwaitingOTP: false}})
+	service.mu.Lock()
+	if len(service.pending) != 0 {
+		t.Fatalf("state event retained prompts: %#v", service.pending)
+	}
+	service.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := service.Flush(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Flush without dispatcher = %v, want canceled", err)
+	}
+	controller.emit(vpn.Event{Kind: vpn.EventKindAction})
+	service.eventMu.Lock()
+	defer service.eventMu.Unlock()
+	if len(service.events) != 1 {
+		t.Fatalf("notification appended after stopping: %d", len(service.events))
+	}
+}
+
+func TestPrivateIdentityMalformedCallbackAndDisplayName(t *testing.T) {
+	if _, _, ok := privateIdentity(nil); ok {
+		t.Fatal("nil update has an identity")
+	}
+	if _, _, ok := privateIdentity(&models.Update{CallbackQuery: &models.CallbackQuery{}}); ok {
+		t.Fatal("inaccessible callback has an identity")
+	}
+	if got := displayName(&models.User{FirstName: "First", LastName: "Last"}); got != "First Last" {
+		t.Fatalf("displayName = %q", got)
+	}
+	if got := displayName(&models.User{Username: "fallback"}); got != "fallback" {
+		t.Fatalf("fallback displayName = %q", got)
+	}
+}
+
+func TestNewRejectsAccessStoreFailure(t *testing.T) {
+	blocker := filepath.Join(t.TempDir(), "directory")
+	if err := os.Mkdir(blocker, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New("unused", testOwnerID, blocker, nil); err == nil {
+		t.Fatal("New accepted an unreadable access-store path")
+	}
 }

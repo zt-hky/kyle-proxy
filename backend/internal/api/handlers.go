@@ -15,14 +15,30 @@ import (
 	"globalprotect-manager/internal/vpn"
 )
 
+type vpnController interface {
+	Connect(control.ConnectOptions) error
+	SubmitOTP(string) error
+	Disconnect() error
+	Status() vpn.Status
+	Logs() []string
+}
+
+var certDirectory = "/data/certs"
+
+var installCertificate = func(certPath string) ([]byte, error) {
+	return exec.Command("sh", "-c",
+		fmt.Sprintf("cp %s /usr/local/share/ca-certificates/globalprotect-manager-ca.crt && update-ca-certificates", certPath)).
+		CombinedOutput()
+}
+
 // Handler holds all dependencies for HTTP handlers
 type Handler struct {
-	controller *control.VPN
+	controller vpnController
 	cfgMgr     *config.Manager
 	githubAuth *auth.GitHubAuth
 }
 
-func newHandler(cn *control.VPN, c *config.Manager, ga *auth.GitHubAuth) *Handler {
+func newHandler(cn vpnController, c *config.Manager, ga *auth.GitHubAuth) *Handler {
 	return &Handler{controller: cn, cfgMgr: c, githubAuth: ga}
 }
 
@@ -179,7 +195,7 @@ func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	certDir := "/data/certs"
+	certDir := certDirectory
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -207,9 +223,8 @@ func (h *Handler) handleCertUpload(w http.ResponseWriter, r *http.Request) {
 	cfg := h.cfgMgr.Get()
 	cfg.VPN.CertFile = certPath
 	_ = h.cfgMgr.Save(cfg)
-	installCmd := exec.Command("sh", "-c",
-		fmt.Sprintf("cp %s /usr/local/share/ca-certificates/globalprotect-manager-ca.crt && update-ca-certificates", certPath))
-	if outBytes, err := installCmd.CombinedOutput(); err != nil {
+	outBytes, err := installCertificate(certPath)
+	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "uploaded", "path": certPath,
 			"warning": fmt.Sprintf("system trust install failed: %s", string(outBytes)),

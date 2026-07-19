@@ -72,9 +72,8 @@ func (m *Manager) Get() *AppConfig {
 	if m.cfg == nil {
 		return Default()
 	}
-	// Return a copy to avoid races
-	copy := *m.cfg
-	return &copy
+	// Return a copy to avoid races and prevent slice aliasing.
+	return clone(m.cfg)
 }
 
 // Save persists updated config to disk
@@ -95,8 +94,14 @@ func (m *Manager) Save(updated *AppConfig) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 
-	m.cfg = updated
+	m.cfg = clone(updated)
 	return nil
+}
+
+func clone(cfg *AppConfig) *AppConfig {
+	copy := *cfg
+	copy.VPN.ExtraArgs = append([]string(nil), cfg.VPN.ExtraArgs...)
+	return &copy
 }
 
 // UpdateVPN updates only the VPN portion of config
@@ -107,6 +112,7 @@ func (m *Manager) UpdateVPN(vpn VPNConfig) error {
 		m.cfg = Default()
 	}
 	m.cfg.VPN = vpn
+	m.cfg.VPN.ExtraArgs = append([]string(nil), vpn.ExtraArgs...)
 	return m.saveUnlocked()
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -68,5 +69,105 @@ func TestUpdateVPNPersistsPrivateFile(t *testing.T) {
 	reloaded := NewManager(path).Load()
 	if reloaded.VPN.Portal != want.Portal || reloaded.VPN.Password != want.Password || !reloaded.VPN.AutoReconnect {
 		t.Fatalf("reloaded = %+v", reloaded.VPN)
+	}
+}
+
+func TestLoadMissingAndCorruptReturnDefaults(t *testing.T) {
+	missing := NewManager(filepath.Join(t.TempDir(), "missing.json"))
+	if got := missing.Load(); !reflect.DeepEqual(got.VPN, VPNConfig{}) {
+		t.Fatalf("missing config = %+v", got)
+	}
+
+	path := filepath.Join(t.TempDir(), "corrupt.json")
+	if err := os.WriteFile(path, []byte(`{"vpn":`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := NewManager(path).Load(); !reflect.DeepEqual(got.VPN, VPNConfig{}) {
+		t.Fatalf("corrupt config = %+v", got)
+	}
+}
+
+func TestGetBeforeLoadReturnsDefaultAndDeepCopy(t *testing.T) {
+	manager := NewManager(filepath.Join(t.TempDir(), "config.json"))
+	if got := manager.Get(); !reflect.DeepEqual(got.VPN, VPNConfig{}) {
+		t.Fatalf("before load = %+v", got)
+	}
+	want := &AppConfig{VPN: VPNConfig{ExtraArgs: []string{"--one"}}}
+	if err := manager.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	want.VPN.ExtraArgs[0] = "--mutated-input"
+	if manager.Get().VPN.ExtraArgs[0] != "--one" {
+		t.Fatal("Save retained an ExtraArgs slice alias")
+	}
+	got := manager.Get()
+	got.VPN.ExtraArgs[0] = "--mutated"
+	if manager.Get().VPN.ExtraArgs[0] != "--one" {
+		t.Fatal("Get returned an ExtraArgs slice alias")
+	}
+}
+
+func TestSaveCreatesDirectoryPersistsAndSetsPrivatePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.json")
+	manager := NewManager(path)
+	want := &AppConfig{VPN: VPNConfig{Portal: "vpn.example", ExtraArgs: []string{"--one"}}}
+	if err := manager.Save(want); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("mode = %o, want 600", info.Mode().Perm())
+	}
+	if got := NewManager(path).Load(); got.VPN.Portal != want.VPN.Portal {
+		t.Fatalf("loaded = %+v", got)
+	}
+}
+
+func TestSaveAndUpdateReportFilesystemErrors(t *testing.T) {
+	t.Run("create directory", func(t *testing.T) {
+		parent := filepath.Join(t.TempDir(), "file")
+		if err := os.WriteFile(parent, []byte("not a directory"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(filepath.Join(parent, "config.json"))
+		if err := manager.Save(Default()); err == nil {
+			t.Fatal("Save succeeded with a file as its parent directory")
+		}
+		if err := manager.UpdateVPN(VPNConfig{Portal: "vpn.example"}); err == nil {
+			t.Fatal("UpdateVPN succeeded with a file as its parent directory")
+		}
+	})
+
+	t.Run("write file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(path)
+		if err := manager.Save(Default()); err == nil {
+			t.Fatal("Save succeeded when config path is a directory")
+		}
+		if err := manager.UpdateVPN(VPNConfig{Portal: "vpn.example"}); err == nil {
+			t.Fatal("UpdateVPN succeeded when config path is a directory")
+		}
+	})
+}
+
+func TestUpdateVPNBeforeLoadPersistsAllFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	manager := NewManager(path)
+	want := VPNConfig{Portal: "vpn.example", Username: "alice", ExtraArgs: []string{"--one"}}
+	if err := manager.UpdateVPN(want); err != nil {
+		t.Fatal(err)
+	}
+	want.ExtraArgs[0] = "--mutated-input"
+	if manager.Get().VPN.ExtraArgs[0] != "--one" {
+		t.Fatal("UpdateVPN retained an ExtraArgs slice alias")
+	}
+	if got := NewManager(path).Load().VPN; got.ExtraArgs[0] != "--one" || got.Portal != want.Portal || got.Username != want.Username {
+		t.Fatalf("loaded = %+v", got)
 	}
 }

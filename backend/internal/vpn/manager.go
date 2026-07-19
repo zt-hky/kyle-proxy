@@ -20,6 +20,13 @@ import (
 )
 
 var sensitiveLogValueRE = regexp.MustCompile(`(?i)(password|passwd|otp|totp|secret|token|cookie|authcookie|portal-userauthcookie|prelogin-cookie|challenge|inputstr)(["'=:\s]+)([^&<>"'\s]+)`)
+var (
+	execCommand       = exec.Command
+	listInterfaces    = net.Interfaces
+	interfaceByName   = net.InterfaceByName
+	interfaceAddrs    = func(iface *net.Interface) ([]net.Addr, error) { return iface.Addrs() }
+	interfacePollWait = time.Sleep
+)
 
 // State represents VPN connection state
 type State string
@@ -734,7 +741,7 @@ func (m *Manager) runOpenConnect(req ConnectRequest, directGateway bool) error {
 	args = append(args, req.ExtraArgs...)
 	args = append(args, server)
 
-	cmd := exec.Command("openconnect", args...)
+	cmd := execCommand("openconnect", args...)
 	cmd.Env = os.Environ()
 
 	// Feed the password and any token supplied at connect time, then keep stdin
@@ -1102,14 +1109,14 @@ func sanitizeLogLine(line string) string {
 // detectTunInterface finds the tun/gpd interface created by gpclient
 func detectTunInterface() string {
 	for i := 0; i < 10; i++ {
-		ifaces, _ := net.Interfaces()
+		ifaces, _ := listInterfaces()
 		for _, iface := range ifaces {
 			n := iface.Name
 			if isVPNInterfaceName(n) {
 				return n
 			}
 		}
-		time.Sleep(300 * time.Millisecond)
+		interfacePollWait(300 * time.Millisecond)
 	}
 	return ""
 }
@@ -1129,11 +1136,11 @@ func isVPNInterfaceName(name string) bool {
 
 // getInterfaceIP returns the first IPv4 address of the given interface
 func getInterfaceIP(ifaceName string) string {
-	iface, err := net.InterfaceByName(ifaceName)
+	iface, err := interfaceByName(ifaceName)
 	if err != nil {
 		return ""
 	}
-	addrs, _ := iface.Addrs()
+	addrs, _ := interfaceAddrs(iface)
 	for _, addr := range addrs {
 		switch v := addr.(type) {
 		case *net.IPNet:
