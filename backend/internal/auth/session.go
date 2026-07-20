@@ -8,7 +8,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const sessionCookie = "kyle_session"
+const sessionCookie = "globalprotect_manager_session"
 
 // Claims holds the JWT payload for the management UI session.
 type Claims struct {
@@ -20,7 +20,7 @@ func jwtSecret() []byte {
 	if s := os.Getenv("AUTH_SECRET"); s != "" {
 		return []byte(s)
 	}
-	return []byte("kyle-proxy-dev-secret-change-me")
+	return []byte("globalprotect-manager-dev-secret-change-me")
 }
 
 // IssueSession sets a signed JWT cookie on the response.

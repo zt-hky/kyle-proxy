@@ -12,8 +12,7 @@ const DefaultConfigPath = "/data/config.json"
 
 // AppConfig holds all persistent configuration
 type AppConfig struct {
-	VPN   VPNConfig   `json:"vpn"`
-	Proxy ProxyConfig `json:"proxy"`
+	VPN VPNConfig `json:"vpn"`
 }
 
 // VPNConfig stores GlobalProtect VPN settings
@@ -29,23 +28,9 @@ type VPNConfig struct {
 	ExtraArgs     []string `json:"extra_args,omitempty"`
 }
 
-// ProxyConfig stores v2ray proxy settings
-type ProxyConfig struct {
-	HTTPPort   int    `json:"http_port"`
-	Socks5Port int    `json:"socks5_port"`
-	VMessPort  int    `json:"vmess_port"`            // VMess inbound port for v2box/v2ray clients
-	ServerHost string `json:"server_host,omitempty"` // public IP/hostname used in vmess:// links
-}
-
 // Default returns a config with sensible defaults
 func Default() *AppConfig {
-	return &AppConfig{
-		Proxy: ProxyConfig{
-			HTTPPort:   8080,
-			Socks5Port: 1080,
-			VMessPort:  8388,
-		},
-	}
+	return &AppConfig{}
 }
 
 // Manager manages loading and saving config with thread safety
@@ -87,9 +72,8 @@ func (m *Manager) Get() *AppConfig {
 	if m.cfg == nil {
 		return Default()
 	}
-	// Return a copy to avoid races
-	copy := *m.cfg
-	return &copy
+	// Return a copy to avoid races and prevent slice aliasing.
+	return clone(m.cfg)
 }
 
 // Save persists updated config to disk
@@ -110,8 +94,14 @@ func (m *Manager) Save(updated *AppConfig) error {
 		return fmt.Errorf("write config: %w", err)
 	}
 
-	m.cfg = updated
+	m.cfg = clone(updated)
 	return nil
+}
+
+func clone(cfg *AppConfig) *AppConfig {
+	copy := *cfg
+	copy.VPN.ExtraArgs = append([]string(nil), cfg.VPN.ExtraArgs...)
+	return &copy
 }
 
 // UpdateVPN updates only the VPN portion of config
@@ -122,17 +112,7 @@ func (m *Manager) UpdateVPN(vpn VPNConfig) error {
 		m.cfg = Default()
 	}
 	m.cfg.VPN = vpn
-	return m.saveUnlocked()
-}
-
-// UpdateProxy updates only the proxy portion of config
-func (m *Manager) UpdateProxy(proxy ProxyConfig) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.cfg == nil {
-		m.cfg = Default()
-	}
-	m.cfg.Proxy = proxy
+	m.cfg.VPN.ExtraArgs = append([]string(nil), vpn.ExtraArgs...)
 	return m.saveUnlocked()
 }
 

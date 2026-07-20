@@ -1,0 +1,4 @@
+# Local macOS/OrbStack override: /dev/net/tun is created by entrypoint inside the Linux VM.
+services:
+  globalprotect-manager:
+    devices: !reset []

@@ -3,13 +3,10 @@
   import { api } from './lib/api.js'
   import VpnPanel from './lib/VpnPanel.svelte'
   import ConfigPanel from './lib/ConfigPanel.svelte'
-  import ProxyPanel from './lib/ProxyPanel.svelte'
   import LogPanel from './lib/LogPanel.svelte'
-  import UsersPanel from './lib/UsersPanel.svelte'
 
   let tab = 'dashboard'
-  let status = { vpn: { state: 'disconnected' }, proxy: { running: false } }
-  let proxyInfo = null
+  let status = { vpn: { state: 'disconnected' } }
   let pollInterval = null
   let toast = null
 
@@ -32,7 +29,6 @@
 
   onMount(async () => {
     await poll()
-    try { proxyInfo = await api.proxyInfo() } catch {}
     try { authState = await api.authStatus() } catch {}
     // Redirect to login if auth required and not logged in
     if (authState.auth_enabled && !authState.logged_in) {
@@ -52,7 +48,7 @@
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
       </svg>
-      <span>Kyle VPN Proxy</span>
+      <span>GlobalProtect Manager</span>
     </div>
     <div class="header-right">
       <div class="status-badges">
@@ -60,9 +56,6 @@
                             class:yellow={status.vpn.state === 'connecting' || status.vpn.state === 'disconnecting'}
                             class:red={status.vpn.state === 'error'}>
           VPN: {status.vpn.state}
-        </span>
-        <span class="badge" class:green={status.proxy.running}>
-          Proxy: {status.proxy.running ? 'running' : 'stopped'}
         </span>
       </div>
       {#if authState.auth_enabled && authState.logged_in}
@@ -83,8 +76,6 @@
   <nav class="tabs">
     <button class:active={tab === 'dashboard'} on:click={() => (tab = 'dashboard')}>🏠 Dashboard</button>
     <button class:active={tab === 'config'} on:click={() => (tab = 'config')}>⚙️ Config</button>
-    <button class:active={tab === 'proxy'} on:click={() => (tab = 'proxy')}>📡 Proxy</button>
-    <button class:active={tab === 'users'} on:click={() => (tab = 'users')}>🔐 Users</button>
     <button class:active={tab === 'logs'} on:click={() => (tab = 'logs')}>📋 Logs</button>
   </nav>
 
@@ -94,10 +85,6 @@
       <VpnPanel {status} on:toast={(e) => showToast(e.detail.msg, e.detail.type)} />
     {:else if tab === 'config'}
       <ConfigPanel on:toast={(e) => showToast(e.detail.msg, e.detail.type)} />
-    {:else if tab === 'proxy'}
-      <ProxyPanel {proxyInfo} {status} />
-    {:else if tab === 'users'}
-      <UsersPanel {proxyInfo} on:toast={(e) => showToast(e.detail.msg, e.detail.type)} />
     {:else if tab === 'logs'}
       <LogPanel />
     {/if}

@@ -2,7 +2,7 @@
   import { createEventDispatcher, onMount } from 'svelte'
   import { api } from '../lib/api.js'
 
-  export let status = { vpn: { state: 'disconnected' }, proxy: { running: false } }
+  export let status = { vpn: { state: 'disconnected' } }
 
   const dispatch = createEventDispatcher()
 
@@ -183,22 +183,6 @@
   {/if}
 </div>
 
-<!-- Proxy quick status -->
-<div class="card">
-  <h3>Proxy Service</h3>
-  <div class="status-row">
-    <div class="dot" style="background:{status?.proxy?.running ? '#22c55e' : '#ef4444'}"></div>
-    <span class="state-label">{status?.proxy?.running ? 'Running' : 'Stopped'}</span>
-    {#if status?.proxy?.running}
-      <span class="meta">
-        · HTTP :{status.proxy.http_port} · SOCKS5 :{status.proxy.socks5_port}
-      </span>
-    {/if}
-  </div>
-  {#if status?.proxy?.error}
-    <p class="error-msg">{status.proxy.error}</p>
-  {/if}
-</div>
 
 <style>
   .status-row {

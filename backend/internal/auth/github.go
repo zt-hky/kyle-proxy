@@ -26,11 +26,13 @@ type GitHubUser struct {
 // GitHubAuth implements optional GitHub OAuth2 login for the management UI.
 // When GITHUB_CLIENT_ID env var is not set, Enabled = false and no auth is enforced.
 type GitHubAuth struct {
-	conf    *oauth2.Config
-	allowed map[string]bool // lowercase GitHub logins; empty = allow any authenticated user
-	states  map[string]time.Time
-	mu      sync.Mutex
-	Enabled bool
+	conf     *oauth2.Config
+	exchange func(context.Context, *oauth2.Config, string) (*oauth2.Token, error)
+	client   *http.Client
+	allowed  map[string]bool // lowercase GitHub logins; empty = allow any authenticated user
+	states   map[string]time.Time
+	mu       sync.Mutex
+	Enabled  bool
 }
 
 // NewGitHubAuth reads env vars GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_ALLOWED_USERS.
@@ -38,6 +40,10 @@ func NewGitHubAuth() *GitHubAuth {
 	ga := &GitHubAuth{
 		allowed: make(map[string]bool),
 		states:  make(map[string]time.Time),
+		exchange: func(ctx context.Context, c *oauth2.Config, code string) (*oauth2.Token, error) {
+			return c.Exchange(ctx, code)
+		},
+		client: http.DefaultClient,
 	}
 	clientID := os.Getenv("GITHUB_CLIENT_ID")
 	if clientID == "" {
@@ -90,14 +96,14 @@ func (ga *GitHubAuth) Exchange(ctx context.Context, code, state, callbackURL str
 
 	c := *ga.conf
 	c.RedirectURL = callbackURL
-	tok, err := c.Exchange(ctx, code)
+	tok, err := ga.exchange(ctx, &c, code)
 	if err != nil {
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}
 
 	req, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/user", nil)
 	req.Header.Set("Authorization", "token "+tok.AccessToken)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ga.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("github /user: %w", err)
 	}
@@ -121,7 +127,7 @@ func randHex(n int) string {
 }
 
 // Middleware protects all routes requiring authentication.
-// Public paths: /auth/*, /api/health, /pac, /pac/*
+// Public paths: /auth/* and /api/health.
 // If auth is disabled (Enabled = false), this is a no-op.
 func (ga *GitHubAuth) Middleware(next http.Handler) http.Handler {
 	if !ga.Enabled {
@@ -133,9 +139,7 @@ func (ga *GitHubAuth) Middleware(next http.Handler) http.Handler {
 		case path == "/auth/login",
 			path == "/auth/callback",
 			path == "/auth/logout",
-			path == "/api/health",
-			path == "/pac",
-			strings.HasPrefix(path, "/pac/"):
+			path == "/api/health":
 			next.ServeHTTP(w, r)
 			return
 		}
