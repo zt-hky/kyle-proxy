@@ -108,7 +108,7 @@ On the owner account:
 3. Choose **Approve** or **Deny**.
 4. The decision is persisted before the user is notified.
 
-After approval, the user can send `/menu`, `/status`, `/connect`, and `/disconnect`. Repeating `/start` while pending does not create a duplicate request. A denied user remains denied until the owner changes the decision.
+After approval, the user can send `/menu`, `/status`, `/logs`, `/connect`, and `/disconnect`. Repeating `/start` while pending does not create a duplicate request. A denied user remains denied until the owner changes the decision.
 
 To remove access, use `/access` and revoke the approved user. Revocation immediately cancels that user's pending OTP prompt. Old buttons and OTP replies are rejected after revocation.
 
@@ -119,11 +119,24 @@ To remove access, use `/access` and revoke the approved user. Revocation immedia
 | `/start` | Anyone in a private chat | Initialize owner, request access, or show existing status |
 | `/menu` | Owner or approved user | Show state-aware VPN actions |
 | `/status` | Owner or approved user | Show current GlobalProtect state and phase |
+| `/logs` | Owner or approved user | Start or stop a live, sanitized VPN log view |
 | `/connect` | Owner or approved user | Connect the configured profile |
 | `/disconnect` | Owner or approved user | Disconnect the active connection |
 | `/access` | Owner only | Review and manage access records |
 
 Unknown text does not trigger VPN actions. Non-command text is consumed only when it is a valid reply to an active OTP prompt.
+
+## Live logs
+
+Send `/logs`, `/logs start`, or select **Logs** from the menu to start one private live-log stream for your account. The bot immediately sends only the newest 20 log lines, then edits that same persistent Telegram message whenever a sanitized VPN log line is appended. Select **Older logs** to reveal 20 additional older lines at a time without creating another message. Bursts are coalesced into the latest snapshot, which stays within Telegram's 4096 UTF-16 code-unit limit; the original unsanitized process stream is never exposed. Telegram log edits run independently and do not hold the authorization lock during network I/O, so status, connect, disconnect, OTP, and menu actions remain responsive while streaming.
+
+Select **Stop** or send `/logs stop` to finalize the current snapshot and stop updates. Starting twice does not create duplicate streams. Revocation and service shutdown cancel the stream and remove its persistent control or output message.
+
+Selecting **Connect** or **Disconnect** automatically starts this same one-message log stream for the initiating user, initially showing only the newest 20 lines. While that VPN action is active, lifecycle events are folded into the stream instead of being sent as separate Telegram messages. The stream finalizes automatically with a fixed success or failure line when the action terminates. Selecting **Stop** ends the visible stream early; lifecycle messages for that action remain suppressed until the action itself terminates.
+
+Inline VPN menu cards are deleted after a recognized action is selected. A stale or already-deleted menu does not prevent the selected VPN action.
+
+Only the owner or an approved user in a matching private chat can view logs. Pending, denied, revoked, group, channel, and mismatched chat identities cannot start, update, or stop a stream.
 
 ## OTP behavior
 
@@ -145,14 +158,14 @@ Configure or clear the TOTP seed only through the Web UI. Never send the TOTP se
 
 ## Notifications
 
-Each meaningful GlobalProtect event is attempted once for:
+When no Telegram-initiated connect or disconnect action is being represented by an action log stream, meaningful GlobalProtect events are grouped per recipient into one continuously edited event message. Each new event resets a 30-second inactivity deadline; after 30 seconds without another event, the bot marks that stream idle, and a later event starts a new message. Recipients are:
 
 - the owner
 - every approved user at dequeue time
 
 Pending, denied, and revoked users are excluded. If delivery to one account fails—for example, that account blocked the bot—delivery continues to the remaining recipients and does not alter the VPN state.
 
-Messages include lifecycle information such as state, action, phase, OTP prompt, reconnect attempt, interface, or sanitized errors. Raw process logs, passwords, OTP values, TOTP seeds, cookies, and authorization headers are excluded.
+Messages include lifecycle information such as state, action, phase, OTP prompt, reconnect attempt, interface, or sanitized errors. The `/logs` stream exposes only the manager's bounded, sanitized in-memory log tail. Unsanitized process output, passwords, OTP values, TOTP seeds, cookies, and authorization headers are excluded.
 
 ## Access store
 

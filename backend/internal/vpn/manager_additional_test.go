@@ -218,6 +218,22 @@ func TestGeneratedOTPAndAuthWaitPaths(t *testing.T) {
 	}
 }
 
+func TestAddLogNotifiesAfterAppending(t *testing.T) {
+	m := NewManager()
+	calls := 0
+	m.OnLog(func() {
+		calls++
+		if logs := m.GetLogs(); len(logs) != 1 || !strings.Contains(logs[0], "ready") {
+			t.Fatalf("callback observed logs %v", logs)
+		}
+	})
+
+	m.addLog("ready")
+	if calls != 1 {
+		t.Fatalf("log notifications = %d, want 1", calls)
+	}
+}
+
 func TestAuthWritesLogsClassificationAndReconnect(t *testing.T) {
 	m := NewManager()
 	if err := m.writeInitialAuth(io.Discard, nil); err != nil {

@@ -104,6 +104,7 @@ type Manager struct {
 	eventHead  int
 	eventCond  *sync.Cond
 	onEvent    func(Event)
+	onLog      func()
 }
 
 // EventKind identifies the lifecycle stream that produced an event.
@@ -149,6 +150,14 @@ func (m *Manager) OnEvent(fn func(Event)) {
 	}
 	m.onEvent = fn
 	m.eventCond.Broadcast()
+	m.mu.Unlock()
+}
+
+// OnLog registers a non-blocking notification callback for sanitized log
+// additions. The callback runs after Manager.mu is released.
+func (m *Manager) OnLog(fn func()) {
+	m.mu.Lock()
+	m.onLog = fn
 	m.mu.Unlock()
 }
 
@@ -856,7 +865,6 @@ func (m *Manager) streamOutput(r io.Reader) {
 		switch {
 		case isVPNEstablishedLine(lower):
 			iface := detectTunInterface()
-			m.markConnected(iface)
 			m.mu.RLock()
 			reconnectAttempt := m.reconnectAttempt
 			m.mu.RUnlock()
@@ -868,6 +876,7 @@ func (m *Manager) streamOutput(r io.Reader) {
 			} else {
 				m.addLog("Tunnel established; interface not detected yet")
 			}
+			m.markConnected(iface)
 		case containsAny(lower, "disconnected", "connection terminated", "bye"):
 			m.mu.RLock()
 			s := m.state
@@ -1082,11 +1091,15 @@ func (m *Manager) addLog(line string) {
 	log.Printf("[VPN] %s", line)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.lastLog = line
 	m.logs = append(m.logs, entry)
 	if len(m.logs) > 500 {
 		m.logs = m.logs[len(m.logs)-500:]
+	}
+	callback := m.onLog
+	m.mu.Unlock()
+	if callback != nil {
+		callback()
 	}
 }
 

@@ -20,7 +20,9 @@ type telegramClient interface {
 	DeleteWebhook(context.Context, *bot.DeleteWebhookParams) (bool, error)
 	SetMyCommands(context.Context, *bot.SetMyCommandsParams) (bool, error)
 	SendMessage(context.Context, *bot.SendMessageParams) (*models.Message, error)
-	DeleteMessage(context.Context, *bot.DeleteMessageParams) (bool, error)
+	SendMessageDraft(context.Context, *bot.SendMessageDraftParams) (bool, error)
+	EditMessageText(context.Context, *bot.EditMessageTextParams) (*models.Message, error)
+	DeleteMessages(context.Context, *bot.DeleteMessagesParams) (bool, error)
 	AnswerCallbackQuery(context.Context, *bot.AnswerCallbackQueryParams) (bool, error)
 	Start(context.Context)
 }
@@ -30,7 +32,9 @@ type vpnController interface {
 	SubmitOTP(string) error
 	Disconnect() error
 	Status() vpn.Status
+	Logs() []string
 	OnEvent(func(vpn.Event))
+	OnLog(func())
 	HasSavedOTP() bool
 }
 
@@ -50,6 +54,8 @@ type Service struct {
 	eventHead       int
 	eventInFlight   bool
 	eventStopping   bool
+	eventStreams    *eventStreams
+	logStreams      *logStreams
 }
 
 type pendingOTP struct {
@@ -72,9 +78,11 @@ func New(token string, ownerID int64, accessPath string, controller *control.VPN
 		bot.WithMessageTextHandler("access", bot.MatchTypeCommand, s.accessCommand),
 		bot.WithMessageTextHandler("connect", bot.MatchTypeCommand, s.connect),
 		bot.WithMessageTextHandler("disconnect", bot.MatchTypeCommand, s.disconnect),
+		bot.WithMessageTextHandler("logs", bot.MatchTypeCommand, s.logs),
 		bot.WithCallbackQueryDataHandler("vpn:", bot.MatchTypePrefix, s.callback),
 		bot.WithCallbackQueryDataHandler("access:", bot.MatchTypePrefix, s.accessCallback),
 		bot.WithCallbackQueryDataHandler("menu:", bot.MatchTypePrefix, s.callback),
+		bot.WithCallbackQueryDataHandler("logs:", bot.MatchTypePrefix, s.logsCallback),
 		bot.WithDefaultHandler(s.text),
 	)
 	if err != nil {
@@ -93,29 +101,41 @@ func newService(ownerID int64, access *AccessStore, controller vpnController, cl
 		now:        time.Now,
 		pending:    make(map[int64]pendingOTP),
 	}
+	s.logStreams = newLogStreams(s)
+	s.eventStreams = newEventStreams(s)
 	s.eventCond = sync.NewCond(&s.eventMu)
 	controller.OnEvent(s.notify)
+	controller.OnLog(s.logStreams.notify)
 	return s
 }
 
 func (s *Service) Start(ctx context.Context) {
-	if _, err := s.bot.DeleteWebhook(ctx, &bot.DeleteWebhookParams{DropPendingUpdates: false}); err != nil {
+	_, err := s.bot.DeleteWebhook(ctx, &bot.DeleteWebhookParams{DropPendingUpdates: false})
+	if err != nil && !strings.Contains(err.Error(), "unexpected end of JSON input") {
 		log.Printf("telegram webhook setup failed: %v", err)
 		return
 	}
-	_, err := s.bot.SetMyCommands(ctx, &bot.SetMyCommandsParams{Commands: []models.BotCommand{{Command: "start", Description: "Start"}, {Command: "menu", Description: "VPN menu"}, {Command: "status", Description: "VPN status"}, {Command: "connect", Description: "Connect VPN"}, {Command: "disconnect", Description: "Disconnect VPN"}, {Command: "access", Description: "Manage access"}}})
+	if err != nil {
+		log.Printf("telegram webhook returned an empty response; continuing with polling: %v", err)
+	}
+	_, err = s.bot.SetMyCommands(ctx, &bot.SetMyCommandsParams{Commands: []models.BotCommand{{Command: "start", Description: "Start"}, {Command: "menu", Description: "VPN menu"}, {Command: "status", Description: "VPN status"}, {Command: "logs", Description: "Live VPN logs"}, {Command: "connect", Description: "Connect VPN"}, {Command: "disconnect", Description: "Disconnect VPN"}, {Command: "access", Description: "Manage access"}}})
 	if err != nil {
 		log.Printf("telegram command setup failed: %v", err)
 		return
 	}
 	go s.dispatchEvents(ctx)
+	defer s.BeginShutdown()
 	s.bot.Start(ctx)
 }
 
 func (s *Service) BeginShutdown() {
 	s.mu.Lock()
+	alreadyStopping := s.stopping
 	s.stopping = true
 	s.mu.Unlock()
+	if !alreadyStopping {
+		s.logStreams.shutdown()
+	}
 }
 
 func (s *Service) Flush(ctx context.Context) error {
@@ -123,6 +143,11 @@ func (s *Service) Flush(ctx context.Context) error {
 	s.eventMu.Lock()
 	s.eventStopping = true
 	s.eventCond.Broadcast()
+	s.eventMu.Unlock()
+	if err := s.logStreams.wait(ctx); err != nil {
+		return err
+	}
+	s.eventMu.Lock()
 	for s.eventHead < len(s.events) || s.eventInFlight {
 		if ctx.Err() != nil {
 			s.eventMu.Unlock()
@@ -139,7 +164,7 @@ func (s *Service) Flush(ctx context.Context) error {
 	s.events = nil
 	s.eventHead = 0
 	s.eventMu.Unlock()
-	return nil
+	return s.eventStreams.shutdown(ctx)
 }
 
 func (s *Service) isStopping() bool {
@@ -170,18 +195,22 @@ func privateIdentity(update *models.Update) (chatID, userID int64, ok bool) {
 // allowed must be called while authorizationMu is held for any operation that
 // mutates access or invokes the VPN controller.
 func (s *Service) allowed(update *models.Update) (int64, bool) {
-	if s.isStopping() {
+	chatID, userID, ok := privateIdentity(update)
+	if !ok || !s.userAllowedLocked(userID) {
 		return 0, false
 	}
-	chatID, userID, ok := privateIdentity(update)
-	if !ok {
-		return 0, false
+	return chatID, true
+}
+
+func (s *Service) userAllowedLocked(userID int64) bool {
+	if s.isStopping() {
+		return false
 	}
 	if userID == s.ownerID {
-		return chatID, true
+		return true
 	}
 	r, ok := s.access.Get(userID)
-	return chatID, ok && r.Status == AccessApproved
+	return ok && r.Status == AccessApproved
 }
 
 func (s *Service) start(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -203,9 +232,9 @@ func (s *Service) start(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		case AccessApproved:
 			s.sendMenu(ctx, chat)
 		case AccessPending:
-			s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request is pending owner approval."})
+			s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatAccessDecision(AccessPending)})
 		case AccessDenied:
-			s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request was denied."})
+			s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatAccessDecision(AccessDenied)})
 		}
 		return
 	}
@@ -215,8 +244,8 @@ func (s *Service) start(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		log.Printf("telegram access save failed: %v", err)
 		return
 	}
-	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Access request is pending owner approval."})
-	s.send(ctx, &bot.SendMessageParams{ChatID: s.ownerID, Text: fmt.Sprintf("Access request from %s (%d)", r.DisplayName, id), ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{Text: "Approve", CallbackData: "access:approve:" + fmt.Sprint(id)}, {Text: "Deny", CallbackData: "access:deny:" + fmt.Sprint(id)}}}}})
+	s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatAccessDecision(AccessPending)})
+	s.sendHTML(ctx, &bot.SendMessageParams{ChatID: s.ownerID, Text: formatAccessRequest(r), ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{{{Text: "Approve", CallbackData: "access:approve:" + fmt.Sprint(id)}, {Text: "Deny", CallbackData: "access:deny:" + fmt.Sprint(id)}}}}})
 }
 
 func (s *Service) menu(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -246,15 +275,7 @@ func (s *Service) accessCommand(ctx context.Context, _ *bot.Bot, u *models.Updat
 	if id != s.ownerID {
 		return
 	}
-	records := s.access.Snapshot()
-	text := "Access records:\n"
-	for _, r := range records {
-		text += fmt.Sprintf("%d · %s · %s\n", r.UserID, r.DisplayName, r.Status)
-	}
-	if len(records) == 0 {
-		text += "(none)"
-	}
-	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: text})
+	s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatAccessRecords(s.access.Snapshot())})
 }
 
 func (s *Service) connect(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -270,7 +291,7 @@ func (s *Service) connect(ctx context.Context, _ *bot.Bot, u *models.Update) {
 
 func (s *Service) connectLocked(ctx context.Context, chat, userID int64) {
 	if !s.controller.HasSavedOTP() {
-		msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the initial GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
+		msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatOTPPrompt("initial"), ParseMode: models.ParseModeHTML, ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
 		if err != nil {
 			return
 		}
@@ -279,11 +300,10 @@ func (s *Service) connectLocked(ctx context.Context, chat, userID int64) {
 		s.mu.Unlock()
 		return
 	}
+	s.logStreams.startActionLocked(ctx, chat, userID, "connect")
 	if err := s.controller.Connect(control.ConnectOptions{}); err != nil {
-		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Connect failed: " + err.Error()})
-		return
+		s.logStreams.completeAction(ctx, "connect", false)
 	}
-	s.sendStatus(ctx, chat)
 }
 
 func (s *Service) text(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -306,8 +326,7 @@ func (s *Service) text(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 
-	s.deleteMessage(ctx, chat, prompt.PromptMessageID, "prompt")
-	s.deleteMessage(ctx, chat, u.Message.ID, "OTP")
+	s.deleteMessages(ctx, chat, []int{prompt.PromptMessageID, u.Message.ID}, "OTP claim")
 	if !s.now().Before(prompt.ExpiresAt) {
 		return
 	}
@@ -316,20 +335,32 @@ func (s *Service) text(ctx context.Context, _ *bot.Bot, u *models.Update) {
 	if prompt.Kind == "followup" {
 		err = s.controller.SubmitOTP(u.Message.Text)
 	} else {
+		s.logStreams.startActionLocked(ctx, chat, userID, "connect")
 		err = s.controller.Connect(control.ConnectOptions{OTP: u.Message.Text})
 	}
-	if err != nil {
-		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "OTP failed: " + err.Error()})
-		return
+	if err != nil && !s.logStreams.completeAction(ctx, "connect", false) {
+		s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatOTPError()})
 	}
-	s.sendStatus(ctx, chat)
 }
 
-func (s *Service) deleteMessage(ctx context.Context, chat int64, messageID int, label string) {
-	if _, err := s.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chat, MessageID: messageID}); err != nil {
-		// Telegram errors do not need message contents to be actionable. Logging
-		// only the error type prevents an OTP echoed by an adapter from leaking.
-		log.Printf("telegram %s deletion failed message=%d error=%T", label, messageID, err)
+func (s *Service) deleteMessages(ctx context.Context, chat int64, messageIDs []int, label string) {
+	seen := make(map[int]struct{}, len(messageIDs))
+	filtered := make([]int, 0, len(messageIDs))
+	for _, id := range messageIDs {
+		if id == 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		filtered = append(filtered, id)
+	}
+	if len(filtered) == 0 {
+		return
+	}
+	if _, err := s.bot.DeleteMessages(ctx, &bot.DeleteMessagesParams{ChatID: chat, MessageIDs: filtered}); err != nil {
+		log.Printf("telegram %s deletion failed messages=%v error=%T", label, filtered, err)
 	}
 }
 
@@ -386,11 +417,12 @@ func (s *Service) accessCallback(ctx context.Context, _ *bot.Bot, u *models.Upda
 		s.mu.Lock()
 		delete(s.pending, id)
 		s.mu.Unlock()
+		s.logStreams.revokeLocked(ctx, id)
 		return
 	default:
 		return
 	}
-	s.send(ctx, &bot.SendMessageParams{ChatID: rec.ChatID, Text: fmt.Sprintf("Access status: %s", rec.Status)})
+	s.sendHTML(ctx, &bot.SendMessageParams{ChatID: rec.ChatID, Text: formatAccessDecision(rec.Status)})
 }
 
 func (s *Service) disconnect(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -400,15 +432,17 @@ func (s *Service) disconnect(ctx context.Context, _ *bot.Bot, u *models.Update) 
 	if !ok {
 		return
 	}
-	s.disconnectLocked(ctx, chat)
+	_, userID, _ := privateIdentity(u)
+	s.disconnectLocked(ctx, chat, userID)
 }
 
-func (s *Service) disconnectLocked(ctx context.Context, chat int64) {
+func (s *Service) disconnectLocked(ctx context.Context, chat, userID int64) {
+	s.logStreams.startActionLocked(ctx, chat, userID, "disconnect")
 	if err := s.controller.Disconnect(); err != nil {
-		s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Disconnect failed: " + err.Error()})
+		s.logStreams.completeAction(ctx, "disconnect", false)
 		return
 	}
-	s.sendStatus(ctx, chat)
+	s.logStreams.completeAction(ctx, "disconnect", true)
 }
 
 func (s *Service) callback(ctx context.Context, _ *bot.Bot, u *models.Update) {
@@ -416,6 +450,11 @@ func (s *Service) callback(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 	s.answerCallback(ctx, u.CallbackQuery.ID)
+	switch u.CallbackQuery.Data {
+	case "vpn:status", "vpn:connect", "vpn:disconnect", "vpn:otp", "menu:main", "menu:logs":
+	default:
+		return
+	}
 	s.authorizationMu.Lock()
 	defer s.authorizationMu.Unlock()
 	chat, ok := s.allowed(u)
@@ -423,15 +462,20 @@ func (s *Service) callback(ctx context.Context, _ *bot.Bot, u *models.Update) {
 		return
 	}
 	_, userID, _ := privateIdentity(u)
+	if u.CallbackQuery.Message.Message != nil {
+		s.deleteMessages(ctx, chat, []int{u.CallbackQuery.Message.Message.ID}, "menu origin")
+	}
 	switch u.CallbackQuery.Data {
 	case "vpn:status", "menu:main":
 		s.sendStatus(ctx, chat)
 	case "vpn:connect":
 		s.connectLocked(ctx, chat, userID)
 	case "vpn:disconnect":
-		s.disconnectLocked(ctx, chat)
+		s.disconnectLocked(ctx, chat, userID)
 	case "vpn:otp":
 		s.otpPromptLocked(ctx, chat, userID)
+	case "menu:logs":
+		s.logStreams.startLocked(ctx, chat, userID)
 	}
 }
 
@@ -450,7 +494,7 @@ func (s *Service) otpPromptLocked(ctx context.Context, chat, userID int64) {
 	if !s.controller.Status().AwaitingOTP {
 		return
 	}
-	msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: "Enter the next GlobalProtect OTP.", ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
+	msg, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatOTPPrompt("next"), ParseMode: models.ParseModeHTML, ReplyMarkup: &models.ForceReply{ForceReply: true, InputFieldPlaceholder: "OTP"}})
 	if err != nil {
 		return
 	}
@@ -463,6 +507,11 @@ func (s *Service) send(ctx context.Context, params *bot.SendMessageParams) {
 	_, _ = s.bot.SendMessage(ctx, params)
 }
 
+func (s *Service) sendHTML(ctx context.Context, params *bot.SendMessageParams) {
+	params.ParseMode = models.ParseModeHTML
+	s.send(ctx, params)
+}
+
 func (s *Service) answerCallback(ctx context.Context, id string) {
 	_, _ = s.bot.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: id})
 }
@@ -471,20 +520,26 @@ func (s *Service) sendMenu(ctx context.Context, chat int64) { s.sendStatus(ctx, 
 
 func (s *Service) sendStatus(ctx context.Context, chat int64) {
 	st := s.controller.Status()
-	text := fmt.Sprintf("GlobalProtect · %s\n%s", strings.ToUpper(string(st.State)), st.Detail)
-	buttons := []models.InlineKeyboardButton{{Text: "Status", CallbackData: "vpn:status", Style: "primary"}}
+	rows := [][]models.InlineKeyboardButton{{
+		{Text: "Status", CallbackData: "vpn:status", Style: "primary"},
+		{Text: "Logs", CallbackData: "menu:logs"},
+	}}
+	var actions []models.InlineKeyboardButton
 	switch st.State {
 	case vpn.StateDisconnected, vpn.StateError:
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Connect", CallbackData: "vpn:connect", Style: "success"})
+		actions = append(actions, models.InlineKeyboardButton{Text: "Connect", CallbackData: "vpn:connect", Style: "success"})
 	case vpn.StateConnecting:
 		if st.AwaitingOTP {
-			buttons = append(buttons, models.InlineKeyboardButton{Text: "Enter OTP", CallbackData: "vpn:otp", Style: "primary"})
+			actions = append(actions, models.InlineKeyboardButton{Text: "Enter OTP", CallbackData: "vpn:otp", Style: "primary"})
 		}
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
+		actions = append(actions, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
 	case vpn.StateConnected:
-		buttons = append(buttons, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
+		actions = append(actions, models.InlineKeyboardButton{Text: "Disconnect", CallbackData: "vpn:disconnect", Style: "danger"})
 	}
-	s.send(ctx, &bot.SendMessageParams{ChatID: chat, Text: text, ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{buttons}}})
+	if len(actions) != 0 {
+		rows = append(rows, actions)
+	}
+	s.sendHTML(ctx, &bot.SendMessageParams{ChatID: chat, Text: formatStatus(st), ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: rows}})
 }
 
 func (s *Service) notify(e vpn.Event) {
@@ -496,6 +551,9 @@ func (s *Service) notify(e vpn.Event) {
 		}
 	}
 	s.mu.Unlock()
+	if s.logStreams.handleEvent(context.Background(), e) {
+		return
+	}
 
 	s.eventMu.Lock()
 	if !s.eventStopping {
@@ -539,11 +597,8 @@ func (s *Service) dispatchEvents(ctx context.Context) {
 			recipients = append(recipients, chat)
 		}
 		sort.Slice(recipients, func(i, j int) bool { return recipients[i] < recipients[j] })
-		text := fmt.Sprintf("GlobalProtect · %s\n%s", strings.ToUpper(e.Name), e.Detail)
 		for _, chat := range recipients {
-			if _, err := s.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: chat, Text: text}); err != nil {
-				log.Printf("telegram notification failed chat=%d error=%T", chat, err)
-			}
+			s.eventStreams.push(ctx, chat, e)
 		}
 
 		s.eventMu.Lock()

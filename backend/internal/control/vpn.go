@@ -21,6 +21,7 @@ type manager interface {
 	GetStatus() vpn.Status
 	GetLogs() []string
 	OnEvent(func(vpn.Event))
+	OnLog(func())
 }
 
 type VPN struct {
@@ -58,6 +59,7 @@ func (c *VPN) Disconnect() error          { return c.manager.Disconnect() }
 func (c *VPN) Status() vpn.Status         { return c.manager.GetStatus() }
 func (c *VPN) Logs() []string             { return c.manager.GetLogs() }
 func (c *VPN) OnEvent(fn func(vpn.Event)) { c.manager.OnEvent(fn) }
+func (c *VPN) OnLog(fn func())            { c.manager.OnLog(fn) }
 
 func (c *VPN) HasSavedOTP() bool {
 	return strings.TrimSpace(c.config.Get().VPN.OTPSecret) != ""

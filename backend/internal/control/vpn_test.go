@@ -19,6 +19,7 @@ type fakeManager struct {
 	status          vpn.Status
 	logs            []string
 	onEvent         func(vpn.Event)
+	onLog           func()
 }
 
 func (m *fakeManager) Connect(req vpn.ConnectRequest) error {
@@ -41,6 +42,7 @@ func (m *fakeManager) GetLogs() []string     { return m.logs }
 func (m *fakeManager) OnEvent(fn func(vpn.Event)) {
 	m.onEvent = fn
 }
+func (m *fakeManager) OnLog(fn func()) { m.onLog = fn }
 
 func newTestController(t *testing.T, vpnConfig config.VPNConfig) (*VPN, *fakeManager, *config.AppConfig) {
 	t.Helper()
