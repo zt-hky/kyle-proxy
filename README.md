@@ -10,8 +10,11 @@ make build
 
 ## Run
 
+The default Compose file pulls the multi-architecture image from GitHub Container Registry:
+
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Open `http://<host>:8888`.

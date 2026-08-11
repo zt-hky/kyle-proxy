@@ -53,15 +53,17 @@ docker compose config
 
 Confirm that:
 
-- service, image, and container are named `globalprotect-manager`
+- the image is `ghcr.io/zt-hky/globalprotect-manager:latest` (or the version set in `GHCR_IMAGE`)
 - only `8888:8888` is published
 - `/dev/net/tun`, `NET_ADMIN`, and `SYS_PTRACE` are present
 - the volume resolves to `globalprotect-manager-data`
+- the dedicated bridge resolves to `globalprotect-vpn`
 
-### 3. Build and start
+### 3. Pull and start
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 Follow startup and health logs:
@@ -78,6 +80,21 @@ curl -fsS http://localhost:8888/api/health
 ```
 
 Open the UI at `http://<docker-host>:8888`.
+
+### Run a workload through the VPN
+
+The `vpn-client` profile shares the manager's network namespace. Start it only
+after connecting GlobalProtect in the management UI:
+
+```bash
+docker compose --profile vpn-client up -d
+docker compose exec vpn-client wget -qO- https://ifconfig.me
+```
+
+For an application container, copy the `vpn-client` service, replace
+`image` and `command`, and retain
+`network_mode: "service:globalprotect-manager"`. A container on the `vpn`
+bridge alone does **not** use the VPN route.
 
 ## Deploy with plain Docker
 
@@ -170,9 +187,10 @@ docker compose restart globalprotect-manager
 # Stop without deleting data
 docker compose down
 
-# Update and rebuild
+# Update the source checkout and pull the current GHCR image
 git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 ## Backup and restore

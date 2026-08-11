@@ -1,47 +1,35 @@
+# Pull the published multi-architecture image from GitHub Container Registry.
+# Override GHCR_IMAGE to pin a version or use a private package after `docker login ghcr.io`.
 services:
   globalprotect-manager:
-    image: globalprotect-manager:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-      # To build for ARM64 (TV Box):
-      #   docker buildx build --platform linux/arm64 -t globalprotect-manager:arm64 .
+    image: ${GHCR_IMAGE:-ghcr.io/zt-hky/globalprotect-manager:latest}
     container_name: globalprotect-manager
     restart: unless-stopped
     stop_grace_period: 25s
 
     ports:
-      - "8888:8888"   # Web management UI
+      - "8888:8888" # Web management UI
 
-    # ── Required for VPN/TUN ─────────────────────────────────────────────────
+    # Required for the GlobalProtect TUN interface and gpclient.
     cap_add:
-      - NET_ADMIN   # allows creating TUN interfaces and modifying routing
-      - SYS_PTRACE  # allows gpclient to inspect its own process
+      - NET_ADMIN
+      - SYS_PTRACE
     devices:
       - /dev/net/tun:/dev/net/tun
 
-    # ── Persistent data ──────────────────────────────────────────────────────
     volumes:
       - globalprotect-manager-data:/data
-      # Optional: mount your own certs directory
-      # - ./certs:/data/certs:ro
 
     environment:
-      - CONFIG_PATH=/data/config.json
-      - LISTEN_ADDR=:8888
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
-      - TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID:-}
-      - TELEGRAM_ACCESS_PATH=${TELEGRAM_ACCESS_PATH:-/data/telegram-access.json}
-      # ── GitHub OAuth (optional — protects the management UI) ──────────────
-      # Create an OAuth App at https://github.com/settings/developers
-      # Callback URL: http://<your-host>:8888/auth/callback
-      # - GITHUB_CLIENT_ID=your_client_id
-      # - GITHUB_CLIENT_SECRET=your_client_secret
-      # - GITHUB_ALLOWED_USERS=your_github_username,coworker_username
-      # - AUTH_SECRET=change-this-to-a-random-secret   # JWT signing secret
-      # - PUBLIC_URL=http://192.168.1.100:8888          # needed if behind NAT
+      CONFIG_PATH: /data/config.json
+      LISTEN_ADDR: :8888
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_OWNER_ID: ${TELEGRAM_OWNER_ID:-}
+      TELEGRAM_ACCESS_PATH: ${TELEGRAM_ACCESS_PATH:-/data/telegram-access.json}
 
-    # ── Resource limits (for TV box: 2 GB RAM / 4 cores) ────────────────────
+    networks:
+      - vpn
+
     deploy:
       resources:
         limits:
@@ -50,7 +38,6 @@ services:
         reservations:
           memory: 64M
 
-    # ── Health check ─────────────────────────────────────────────────────────
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8888/api/health"]
       interval: 30s
@@ -58,7 +45,30 @@ services:
       retries: 3
       start_period: 10s
 
+  # Start with `docker compose --profile vpn-client up -d`. This service shares
+  # the VPN container's network namespace, so every process launched inside it
+  # uses the GlobalProtect routes after the VPN connects:
+  #   docker compose exec vpn-client wget -qO- https://ifconfig.me
+  # For a real workload, copy this service and replace image/command; do not add
+  # `networks`, because network_mode and networks are mutually exclusive.
+  vpn-client:
+    image: alpine:3.21
+    profiles: ["vpn-client"]
+    restart: unless-stopped
+    network_mode: "service:globalprotect-manager"
+    depends_on:
+      globalprotect-manager:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
+
 volumes:
   globalprotect-manager-data:
     name: globalprotect-manager-data
     driver: local
+
+networks:
+  # Dedicated bridge for the VPN namespace. Workloads that must traverse the
+  # VPN join it by sharing the manager namespace via network_mode above.
+  vpn:
+    name: globalprotect-vpn
+    driver: bridge
