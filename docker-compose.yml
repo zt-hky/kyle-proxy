@@ -3,7 +3,6 @@
 services:
   globalprotect-manager:
     image: ${GHCR_IMAGE:-ghcr.io/zt-hky/globalprotect-manager:latest}
-    container_name: globalprotect-manager
     restart: unless-stopped
     stop_grace_period: 25s
 
